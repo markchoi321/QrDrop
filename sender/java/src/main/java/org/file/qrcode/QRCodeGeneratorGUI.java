@@ -28,7 +28,9 @@ import java.util.zip.CRC32;
  */
 public class QRCodeGeneratorGUI extends JFrame {
 
-    private static final int CHUNK_SIZE = 600;
+    /** 分片大小(Byte) */
+    private static final int CHUNK_SIZE = 1024;
+    /** 二维码尺寸(像素) */
     private static final int QR_SIZE = 800;
     private static final int DISPLAY_INTERVAL = 2000;
 
