@@ -256,6 +256,8 @@ struct FileProgressSection: View {
     let isExpanded: Bool
     let onTap: () -> Void
 
+    @State private var copiedMissing = false
+
     var body: some View {
         if let info = receiver.fileInfo[fileId] {
             let received = receiver.files[fileId]?.count ?? 0
@@ -334,19 +336,61 @@ struct FileProgressSection: View {
         return Group {
             if !missing.isEmpty && missing.count <= 50 {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("缺失片段（共 \(missing.count) 个）:")
-                        .font(.caption.bold())
-                        .foregroundStyle(.red)
+                    HStack {
+                        Text("缺失片段（共 \(missing.count) 个）:")
+                            .font(.caption.bold())
+                            .foregroundStyle(.red)
+                        Spacer()
+                        Button {
+                            let jsonArray = missing.map { $0 + 1 }
+                            if let data = try? JSONEncoder().encode(jsonArray),
+                               let jsonString = String(data: data, encoding: .utf8) {
+                                UIPasteboard.general.string = jsonString
+                                copiedMissing = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    copiedMissing = false
+                                }
+                            }
+                        } label: {
+                            Label(copiedMissing ? "已复制" : "复制",
+                                  systemImage: copiedMissing ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .tint(copiedMissing ? .green : .red)
+                    }
                     Text(missing.map { String($0 + 1) }.joined(separator: ", "))
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.red)
                 }
                 .padding(.vertical, 4)
             } else if !missing.isEmpty {
-                Text("缺失 \(missing.count) 个片段")
-                    .font(.caption.bold())
-                    .foregroundStyle(.red)
-                    .padding(.vertical, 4)
+                HStack {
+                    Text("缺失 \(missing.count) 个片段")
+                        .font(.caption.bold())
+                        .foregroundStyle(.red)
+                    Spacer()
+                    Button {
+                        let jsonArray = missing.map { $0 + 1 }
+                        if let data = try? JSONEncoder().encode(jsonArray),
+                           let jsonString = String(data: data, encoding: .utf8) {
+                            UIPasteboard.general.string = jsonString
+                            copiedMissing = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                copiedMissing = false
+                            }
+                        }
+                    } label: {
+                        Label(copiedMissing ? "已复制" : "复制",
+                              systemImage: copiedMissing ? "checkmark" : "doc.on.doc")
+                        .font(.caption2)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .tint(copiedMissing ? .green : .red)
+                }
+                .padding(.vertical, 4)
             }
         }
     }

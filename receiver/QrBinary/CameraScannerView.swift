@@ -40,39 +40,48 @@ struct CameraScannerView: View {
 
                     Spacer()
 
-                    VStack(spacing: 8) {
-                        if !lastReceivedInfo.isEmpty {
-                            Text(lastReceivedInfo)
-                                .font(.system(.subheadline, design: .monospaced))
-                                .foregroundStyle(.green)
-                                .padding(.horizontal)
-                        }
-
-                        Text("已扫描 \(scanCount) 个片段")
-                            .font(.headline)
-                            .foregroundStyle(.white)
-
-                        ForEach(Array(receiver.fileInfo.keys.sorted()), id: \.self) { fileId in
-                            if let info = receiver.fileInfo[fileId] {
-                                let received = receiver.files[fileId]?.count ?? 0
-                                let total = info.totalChunks
-                                HStack {
-                                    Text(info.fileName)
-                                        .font(.caption)
-                                    Spacer()
-                                    Text("\(received)/\(total)")
-                                        .font(.caption.bold())
-                                }
-                                .foregroundStyle(.white)
-                                .padding(.horizontal)
-
-                                ProgressView(value: Double(received), total: Double(total))
-                                    .tint(.green)
+                    ScrollView {
+                        VStack(spacing: 8) {
+                            if !lastReceivedInfo.isEmpty {
+                                Text(lastReceivedInfo)
+                                    .font(.system(.subheadline, design: .monospaced))
+                                    .foregroundStyle(.green)
                                     .padding(.horizontal)
                             }
+
+                            Text("已扫描 \(scanCount) 个片段")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+
+                            ForEach(Array(receiver.fileInfo.keys.sorted()), id: \.self) { fileId in
+                                if let info = receiver.fileInfo[fileId] {
+                                    let received = receiver.files[fileId]?.count ?? 0
+                                    let total = info.totalChunks
+
+                                    VStack(spacing: 6) {
+                                        HStack {
+                                            Text(info.fileName)
+                                                .font(.caption)
+                                            Spacer()
+                                            Text("\(received)/\(total)")
+                                                .font(.caption.bold())
+                                        }
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal)
+
+                                        ProgressView(value: Double(received), total: Double(total))
+                                            .tint(.green)
+                                            .padding(.horizontal)
+
+                                        missingChunksView(total: total, fileId: fileId)
+                                            .padding(.horizontal)
+                                    }
+                                }
+                            }
                         }
+                        .padding()
                     }
-                    .padding()
+                    .frame(maxHeight: 360)
                     .background(.ultraThinMaterial.opacity(0.9))
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .padding()
@@ -110,6 +119,81 @@ struct CameraScannerView: View {
                 scanner.stop()
             }
         }
+    }
+
+    // MARK: - 缺失片段视图
+
+    @ViewBuilder
+    private func missingChunksView(total: Int, fileId: String) -> some View {
+        let missing = (0..<total).filter { receiver.files[fileId]?[$0] == nil }
+
+        if !missing.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("缺失片段（共 \(missing.count) 个）:")
+                    .font(.caption.bold())
+                    .foregroundStyle(.red)
+
+                FlowLayout(spacing: 4) {
+                    ForEach(missing, id: \.self) { index in
+                        Text("\(index + 1)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.red.opacity(0.7))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+// MARK: - FlowLayout (自适应换行布局)
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let result = arrange(proposal: proposal, subviews: subviews)
+        return result.size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let result = arrange(proposal: proposal, subviews: subviews)
+        for (index, position) in result.positions.enumerated() {
+            subviews[index].place(
+                at: CGPoint(x: bounds.minX + position.x, y: bounds.minY + position.y),
+                proposal: .unspecified
+            )
+        }
+    }
+
+    private func arrange(proposal: ProposedViewSize, subviews: Subviews) -> (size: CGSize, positions: [CGPoint]) {
+        let maxWidth = proposal.width ?? .infinity
+        var positions: [CGPoint] = []
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var maxX: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+
+            if currentX + size.width > maxWidth, currentX > 0 {
+                currentX = 0
+                currentY += lineHeight + spacing
+                lineHeight = 0
+            }
+
+            positions.append(CGPoint(x: currentX, y: currentY))
+            lineHeight = max(lineHeight, size.height)
+            currentX += size.width + spacing
+            maxX = max(maxX, currentX - spacing)
+        }
+
+        return (CGSize(width: maxX, height: currentY + lineHeight), positions)
     }
 }
 
