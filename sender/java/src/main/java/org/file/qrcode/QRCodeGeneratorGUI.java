@@ -35,6 +35,7 @@ public class QRCodeGeneratorGUI extends JFrame {
     private static final int DISPLAY_INTERVAL = 2000;
 
     private ObjectMapper objectMapper = new ObjectMapper();
+    private List<DataChunk> allChunks;
     private List<DataChunk> chunks;
     private int currentIndex = 0;
     private boolean isPaused = false;
@@ -51,8 +52,13 @@ public class QRCodeGeneratorGUI extends JFrame {
     private JButton btnApplyInterval;
     private JLabel speedLabel;
     private JLabel intervalTipLabel;
+    private JTextField filterInput;
+    private JButton btnApplyFilter;
+    private JButton btnResetFilter;
+    private JLabel filterTipLabel;
 
     public QRCodeGeneratorGUI(List<DataChunk> chunks) {
+        this.allChunks = new ArrayList<>(chunks);
         this.chunks = chunks;
         initUI();
         setupTimer();
@@ -148,6 +154,47 @@ public class QRCodeGeneratorGUI extends JFrame {
         btnReset.setAlignmentX(Component.CENTER_ALIGNMENT);
         btnReset.addActionListener(e -> resetToFirst());
 
+        // 片段筛选控制
+        JPanel filterPanel = new JPanel(new BorderLayout(5, 5));
+        filterPanel.setBorder(BorderFactory.createEmptyBorder(5, 5, 5, 5));
+        filterPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
+        filterPanel.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JLabel filterLabel = new JLabel("片段筛选（JSON数组）", JLabel.CENTER);
+        filterLabel.setFont(new Font("微软雅黑", Font.PLAIN, 11));
+
+        JPanel filterInputPanel = new JPanel(new BorderLayout(5, 5));
+        filterInput = new JTextField("[1,2,3]");
+        filterInput.setFont(new Font("微软雅黑", Font.PLAIN, 11));
+        filterInput.setHorizontalAlignment(JTextField.CENTER);
+
+        JPanel filterButtonPanel = new JPanel(new GridLayout(1, 2, 5, 0));
+        btnApplyFilter = new JButton("应用");
+        btnApplyFilter.setFont(new Font("微软雅黑", Font.PLAIN, 11));
+        btnApplyFilter.setBackground(new Color(33, 150, 243));
+        btnApplyFilter.setForeground(Color.BLACK);
+        btnApplyFilter.addActionListener(e -> applyFilter());
+
+        btnResetFilter = new JButton("恢复全部");
+        btnResetFilter.setFont(new Font("微软雅黑", Font.PLAIN, 11));
+        btnResetFilter.setBackground(new Color(158, 158, 158));
+        btnResetFilter.setForeground(Color.BLACK);
+        btnResetFilter.addActionListener(e -> resetFilter());
+
+        filterButtonPanel.add(btnApplyFilter);
+        filterButtonPanel.add(btnResetFilter);
+
+        filterInputPanel.add(filterInput, BorderLayout.CENTER);
+        filterInputPanel.add(filterButtonPanel, BorderLayout.SOUTH);
+
+        filterTipLabel = new JLabel(" ", JLabel.CENTER);
+        filterTipLabel.setFont(new Font("微软雅黑", Font.PLAIN, 10));
+        filterTipLabel.setPreferredSize(new Dimension(0, 20));
+
+        filterPanel.add(filterLabel, BorderLayout.NORTH);
+        filterPanel.add(filterInputPanel, BorderLayout.CENTER);
+        filterPanel.add(filterTipLabel, BorderLayout.SOUTH);
+
         controlPanel.add(btnPause);
         controlPanel.add(Box.createVerticalStrut(5));
         controlPanel.add(btnPrevious);
@@ -157,6 +204,8 @@ public class QRCodeGeneratorGUI extends JFrame {
         controlPanel.add(speedPanel);
         controlPanel.add(Box.createVerticalStrut(5));
         controlPanel.add(btnReset);
+        controlPanel.add(Box.createVerticalStrut(5));
+        controlPanel.add(filterPanel);
 
         // 片段列表
         JPanel listPanel = new JPanel(new BorderLayout());
@@ -360,6 +409,86 @@ public class QRCodeGeneratorGUI extends JFrame {
         // 2秒后清除提示
         javax.swing.Timer tipTimer = new javax.swing.Timer(2000, e -> {
             intervalTipLabel.setText(" ");
+        });
+        tipTimer.setRepeats(false);
+        tipTimer.start();
+    }
+
+    private void applyFilter() {
+        try {
+            String input = filterInput.getText().trim();
+
+            // 解析JSON数组
+            int[] indices = objectMapper.readValue(input, int[].class);
+
+            if (indices.length == 0) {
+                showFilterTip("数组不能为空", Color.RED);
+                return;
+            }
+
+            // 创建筛选后的chunks列表
+            List<DataChunk> filteredChunks = new ArrayList<>();
+            for (int index : indices) {
+                // 用户输入从1开始，需要验证范围是1到allChunks.size()
+                if (index < 1 || index > allChunks.size()) {
+                    showFilterTip("索引 " + index + " 超出范围 (1-" + allChunks.size() + ")", Color.RED);
+                    return;
+                }
+                // 转换为从0开始的内部索引
+                filteredChunks.add(allChunks.get(index - 1));
+            }
+
+            // 更新chunks列表
+            this.chunks = filteredChunks;
+
+            // 更新片段列表显示
+            updateChunkList();
+
+            // 重置到第一个片段
+            currentIndex = 0;
+            displayChunk(0);
+
+            showFilterTip("已筛选 " + filteredChunks.size() + " 个片段", new Color(33, 150, 243));
+
+        } catch (Exception ex) {
+            showFilterTip("JSON格式错误，请输入如 [1,2,3]", Color.RED);
+        }
+    }
+
+    private void resetFilter() {
+        // 恢复所有片段
+        this.chunks = allChunks;
+
+        // 更新片段列表显示（恢复原始格式）
+        listModel.clear();
+        for (int i = 0; i < chunks.size(); i++) {
+            listModel.addElement(String.format("片段 %d/%d", i + 1, chunks.size()));
+        }
+
+        // 重置到第一个片段
+        currentIndex = 0;
+        displayChunk(0);
+
+        showFilterTip("已恢复全部 " + allChunks.size() + " 个片段", new Color(76, 175, 80));
+    }
+
+    private void updateChunkList() {
+        listModel.clear();
+        for (int i = 0; i < chunks.size(); i++) {
+            DataChunk chunk = chunks.get(i);
+            // chunk.chunkIndex是从0开始的，显示时+1
+            listModel.addElement(String.format("片段 %d/%d (原始: %d)",
+                i + 1, chunks.size(), chunk.chunkIndex + 1));
+        }
+    }
+
+    private void showFilterTip(String message, Color color) {
+        filterTipLabel.setText(message);
+        filterTipLabel.setForeground(color);
+
+        // 2秒后清除提示
+        javax.swing.Timer tipTimer = new javax.swing.Timer(2000, e -> {
+            filterTipLabel.setText(" ");
         });
         tipTimer.setRepeats(false);
         tipTimer.start();
