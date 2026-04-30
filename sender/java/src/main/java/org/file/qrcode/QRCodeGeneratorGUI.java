@@ -41,6 +41,9 @@ public class QRCodeGeneratorGUI extends JFrame {
     private List<ImageIcon> precomputedIcons;
     /** 全部二维码图标缓存（筛选恢复时使用） */
     private List<ImageIcon> allPrecomputedIcons;
+    /** 实际生成的二维码图片尺寸（像素） */
+    private int actualQrWidth;
+    private int actualQrHeight;
     private int currentIndex = 0;
     private boolean isPaused = false;
     private javax.swing.Timer timer;
@@ -77,6 +80,10 @@ public class QRCodeGeneratorGUI extends JFrame {
             try {
                 String json = objectMapper.writeValueAsString(chunks.get(i));
                 BufferedImage qrImage = generateQRCode(json);
+                if (i == 0) {
+                    actualQrWidth = qrImage.getWidth();
+                    actualQrHeight = qrImage.getHeight();
+                }
                 allPrecomputedIcons.add(new ImageIcon(qrImage));
             } catch (Exception e) {
                 e.printStackTrace();
@@ -89,7 +96,10 @@ public class QRCodeGeneratorGUI extends JFrame {
     private void initUI() {
         setTitle("二维码传输 - 发送器 - " + chunks.get(0).fileName);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(800, 520);
+        // 窗口尺寸根据实际二维码图片大小动态计算
+        int winWidth = actualQrWidth + 410;
+        int winHeight = Math.max(actualQrHeight, 350) + 155;
+        setSize(winWidth, winHeight);
         setLocationRelativeTo(null);
 
         // 主面板
@@ -319,8 +329,20 @@ public class QRCodeGeneratorGUI extends JFrame {
         hints.put(EncodeHintType.CHARACTER_SET, "UTF-8");
 
         QRCodeWriter qrCodeWriter = new QRCodeWriter();
+
+        // 第一次编码获取精确模块数（传入0获得原始尺寸）
+        BitMatrix probeMatrix = qrCodeWriter.encode(
+                content, BarcodeFormat.QR_CODE, 0, 0, hints
+        );
+        int modules = probeMatrix.getWidth();
+
+        // 计算模块的整数倍像素值（向上取整），消除额外白边
+        int moduleSize = Math.max(1, (QR_SIZE + modules - 1) / modules);
+        int exactSize = moduleSize * modules;
+
+        // 以精确尺寸重新编码
         BitMatrix bitMatrix = qrCodeWriter.encode(
-                content, BarcodeFormat.QR_CODE, QR_SIZE, QR_SIZE, hints
+                content, BarcodeFormat.QR_CODE, exactSize, exactSize, hints
         );
 
         return MatrixToImageWriter.toBufferedImage(bitMatrix);
