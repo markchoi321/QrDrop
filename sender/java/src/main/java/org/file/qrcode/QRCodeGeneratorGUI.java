@@ -1,5 +1,6 @@
 package org.file.qrcode;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.EncodeHintType;
 import com.google.zxing.WriterException;
@@ -7,7 +8,6 @@ import com.google.zxing.client.j2se.MatrixToImageWriter;
 import com.google.zxing.common.BitMatrix;
 import com.google.zxing.qrcode.QRCodeWriter;
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 import javax.swing.*;
 import java.awt.*;
@@ -31,12 +31,16 @@ public class QRCodeGeneratorGUI extends JFrame {
     /** 分片大小(Byte) */
     private static final int CHUNK_SIZE = 1024;
     /** 二维码尺寸(像素) */
-    private static final int QR_SIZE = 800;
+    private static final int QR_SIZE = 350;
     private static final int DISPLAY_INTERVAL = 2000;
 
     private ObjectMapper objectMapper = new ObjectMapper();
     private List<DataChunk> allChunks;
     private List<DataChunk> chunks;
+    /** 预计算的二维码图标缓存（当前分片列表对应的图标） */
+    private List<ImageIcon> precomputedIcons;
+    /** 全部二维码图标缓存（筛选恢复时使用） */
+    private List<ImageIcon> allPrecomputedIcons;
     private int currentIndex = 0;
     private boolean isPaused = false;
     private javax.swing.Timer timer;
@@ -60,14 +64,32 @@ public class QRCodeGeneratorGUI extends JFrame {
     public QRCodeGeneratorGUI(List<DataChunk> chunks) {
         this.allChunks = new ArrayList<>(chunks);
         this.chunks = chunks;
+        precomputeAllQRCodes();
         initUI();
+        displayChunk(0);
         setupTimer();
+    }
+
+    /** 预计算所有分片的二维码图标，避免播放时在EDT上做耗时运算 */
+    private void precomputeAllQRCodes() {
+        allPrecomputedIcons = new ArrayList<>(chunks.size());
+        for (int i = 0; i < chunks.size(); i++) {
+            try {
+                String json = objectMapper.writeValueAsString(chunks.get(i));
+                BufferedImage qrImage = generateQRCode(json);
+                allPrecomputedIcons.add(new ImageIcon(qrImage));
+            } catch (Exception e) {
+                e.printStackTrace();
+                allPrecomputedIcons.add(null);
+            }
+        }
+        precomputedIcons = allPrecomputedIcons;
     }
 
     private void initUI() {
         setTitle("二维码传输 - 发送器 - " + chunks.get(0).fileName);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(1200, 850);
+        setSize(800, 520);
         setLocationRelativeTo(null);
 
         // 主面板
@@ -240,7 +262,7 @@ public class QRCodeGeneratorGUI extends JFrame {
         // 计算原始文件大小
         int totalSize = chunks.size() * CHUNK_SIZE;
         String sizeStr = totalSize < 1024 ? totalSize + " B" :
-                        totalSize < 1024 * 1024 ? String.format("%.1f KB", totalSize / 1024.0) :
+                totalSize < 1024 * 1024 ? String.format("%.1f KB", totalSize / 1024.0) :
                         String.format("%.1f MB", totalSize / (1024.0 * 1024));
         statsPanel.add(new JLabel("约 " + sizeStr));
 
@@ -258,21 +280,10 @@ public class QRCodeGeneratorGUI extends JFrame {
         mainPanel.add(rightPanel, BorderLayout.EAST);
 
         add(mainPanel);
-
-        // 添加组件监听器，确保布局完成后再显示第一个二维码
-        qrImageLabel.addComponentListener(new java.awt.event.ComponentAdapter() {
-            private boolean firstDisplay = true;
-            @Override
-            public void componentResized(java.awt.event.ComponentEvent e) {
-                if (firstDisplay && qrImageLabel.getWidth() > 0) {
-                    firstDisplay = false;
-                    displayChunk(0);
-                }
-            }
-        });
     }
 
     private void setupTimer() {
+        // 使用单次定时器 + 自重启模式，严格保证两次切换之间至少 interval 毫秒
         timer = new javax.swing.Timer(DISPLAY_INTERVAL, new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
@@ -280,47 +291,17 @@ public class QRCodeGeneratorGUI extends JFrame {
                     currentIndex = (currentIndex + 1) % chunks.size();
                     displayChunk(currentIndex);
                 }
+                timer.restart();
             }
         });
+        timer.setRepeats(false);
         timer.start();
     }
 
     private void displayChunk(int index) {
         try {
             currentIndex = index;
-            DataChunk chunk = chunks.get(index);
-            String json = objectMapper.writeValueAsString(chunk);
-
-            BufferedImage qrImage = generateQRCode(json);
-
-            // 自适应缩放二维码以适应窗口大小
-            int labelWidth = qrImageLabel.getWidth();
-            int labelHeight = qrImageLabel.getHeight();
-
-            if (labelWidth > 0 && labelHeight > 0) {
-                // 保持宽高比，计算缩放后的尺寸
-                int qrWidth = qrImage.getWidth();
-                int qrHeight = qrImage.getHeight();
-
-                double scaleWidth = (double) labelWidth / qrWidth;
-                double scaleHeight = (double) labelHeight / qrHeight;
-                double scale = Math.min(scaleWidth, scaleHeight) * 0.95; // 留 5% 边距
-
-                int scaledWidth = (int) (qrWidth * scale);
-                int scaledHeight = (int) (qrHeight * scale);
-
-                if (scale < 1.0) {
-                    // 需要缩小
-                    Image scaledImage = qrImage.getScaledInstance(scaledWidth, scaledHeight, Image.SCALE_SMOOTH);
-                    qrImageLabel.setIcon(new ImageIcon(scaledImage));
-                } else {
-                    // 不需要缩放
-                    qrImageLabel.setIcon(new ImageIcon(qrImage));
-                }
-            } else {
-                // 首次显示时标签尺寸可能还未确定
-                qrImageLabel.setIcon(new ImageIcon(qrImage));
-            }
+            qrImageLabel.setIcon(precomputedIcons.get(index));
 
             // 更新列表选中状态
             chunkList.setSelectedIndex(index);
@@ -339,7 +320,7 @@ public class QRCodeGeneratorGUI extends JFrame {
 
         QRCodeWriter qrCodeWriter = new QRCodeWriter();
         BitMatrix bitMatrix = qrCodeWriter.encode(
-            content, BarcodeFormat.QR_CODE, QR_SIZE, QR_SIZE, hints
+                content, BarcodeFormat.QR_CODE, QR_SIZE, QR_SIZE, hints
         );
 
         return MatrixToImageWriter.toBufferedImage(bitMatrix);
@@ -359,22 +340,26 @@ public class QRCodeGeneratorGUI extends JFrame {
     private void previousChunk() {
         currentIndex = (currentIndex - 1 + chunks.size()) % chunks.size();
         displayChunk(currentIndex);
+        if (timer != null) timer.restart();
     }
 
     private void nextChunk() {
         currentIndex = (currentIndex + 1) % chunks.size();
         displayChunk(currentIndex);
+        if (timer != null) timer.restart();
     }
 
     private void jumpToSelected() {
         int selectedIndex = chunkList.getSelectedIndex();
         if (selectedIndex >= 0) {
             displayChunk(selectedIndex);
+            if (timer != null) timer.restart();
         }
     }
 
     private void resetToFirst() {
         displayChunk(0);
+        if (timer != null) timer.restart();
     }
 
     private void applyInterval() {
@@ -382,15 +367,17 @@ public class QRCodeGeneratorGUI extends JFrame {
             String input = intervalInput.getText().trim();
             int interval = Integer.parseInt(input);
 
-            // 限制间隔范围在 100 毫秒到 30000 毫秒之间
-            if (interval < 100 || interval > 30000) {
-                showIntervalTip("间隔必须在 100 到 30000 毫秒之间", Color.RED);
+            // 限制间隔范围在 50 毫秒到 30000 毫秒之间
+            if (interval < 50 || interval > 30000) {
+                showIntervalTip("间隔必须在 50 到 30000 毫秒之间", Color.RED);
                 return;
             }
 
-            // 应用新的间隔
+            // 应用新的间隔，并立即重置当前周期使其立刻生效
             if (timer != null) {
                 timer.setDelay(interval);
+                timer.setInitialDelay(interval);
+                timer.restart();
             }
 
             // 更新显示标签
@@ -438,8 +425,13 @@ public class QRCodeGeneratorGUI extends JFrame {
                 filteredChunks.add(allChunks.get(index - 1));
             }
 
-            // 更新chunks列表
+            // 更新chunks列表和图标缓存
             this.chunks = filteredChunks;
+            List<ImageIcon> filteredIcons = new ArrayList<>();
+            for (int index : indices) {
+                filteredIcons.add(allPrecomputedIcons.get(index - 1));
+            }
+            this.precomputedIcons = filteredIcons;
 
             // 更新片段列表显示
             updateChunkList();
@@ -447,6 +439,7 @@ public class QRCodeGeneratorGUI extends JFrame {
             // 重置到第一个片段
             currentIndex = 0;
             displayChunk(0);
+            if (timer != null) timer.restart();
 
             showFilterTip("已筛选 " + filteredChunks.size() + " 个片段", new Color(33, 150, 243));
 
@@ -456,8 +449,9 @@ public class QRCodeGeneratorGUI extends JFrame {
     }
 
     private void resetFilter() {
-        // 恢复所有片段
+        // 恢复所有片段和图标
         this.chunks = allChunks;
+        this.precomputedIcons = allPrecomputedIcons;
 
         // 更新片段列表显示（恢复原始格式）
         listModel.clear();
@@ -468,6 +462,7 @@ public class QRCodeGeneratorGUI extends JFrame {
         // 重置到第一个片段
         currentIndex = 0;
         displayChunk(0);
+        if (timer != null) timer.restart();
 
         showFilterTip("已恢复全部 " + allChunks.size() + " 个片段", new Color(76, 175, 80));
     }
@@ -478,7 +473,7 @@ public class QRCodeGeneratorGUI extends JFrame {
             DataChunk chunk = chunks.get(i);
             // chunk.chunkIndex是从0开始的，显示时+1
             listModel.addElement(String.format("片段 %d/%d (原始: %d)",
-                i + 1, chunks.size(), chunk.chunkIndex + 1));
+                    i + 1, chunks.size(), chunk.chunkIndex + 1));
         }
     }
 
@@ -540,7 +535,7 @@ public class QRCodeGeneratorGUI extends JFrame {
             crc32.update(chunkData);
 
             DataChunk chunk = new DataChunk(
-                fileId, fileName, totalChunks, i, base64Data, crc32.getValue()
+                    fileId, fileName, totalChunks, i, base64Data, crc32.getValue()
             );
             chunks.add(chunk);
         }
