@@ -60,6 +60,8 @@ class FileReceiver: ObservableObject {
     @Published var selectedEngine: QREngine = .avFoundation
 
     private var lastDecodeTime: [String: Date] = [:]
+    // 已成功落盘的 QR payload 原始字符串集合，用于在 JSON 解析之前 O(1) 短路重复帧
+    private var confirmedPayloads: Set<String> = []
 
     // MARK: - 日志
 
@@ -94,6 +96,11 @@ class FileReceiver: ObservableObject {
 
     @MainActor
     func processQRCode(_ decodedString: String) -> Bool {
+        // 去重前置：相同 payload 已成功处理过则直接短路，避免 JSON 解析 / base64 / CRC32 全部开销
+        if confirmedPayloads.contains(decodedString) {
+            return false
+        }
+
         guard let jsonData = decodedString.data(using: .utf8) else { return false }
 
         do {
@@ -130,6 +137,7 @@ class FileReceiver: ObservableObject {
                 files[fileId] = [:]
             }
             files[fileId]![chunkIndex] = dataBytes
+            confirmedPayloads.insert(decodedString)
 
             let received = files[fileId]?.count ?? 0
             let total = chunk.totalChunks
@@ -251,6 +259,7 @@ class FileReceiver: ObservableObject {
         files.removeAll()
         fileInfo.removeAll()
         lastDecodeTime.removeAll()
+        confirmedPayloads.removeAll()
         addLog("数据已清空")
     }
 }
