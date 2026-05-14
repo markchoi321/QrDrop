@@ -34,13 +34,31 @@ public class QRCodeGeneratorGUI extends JFrame {
     private static final int QR_SIZE = 350;
     private static final int DISPLAY_INTERVAL = 2000;
 
+    /** 预取窗口大小：当前帧之后保持这么多帧已生成 */
+    private static final int PREFETCH_AHEAD = 30;
+    /** LRU 缓存上限：350x350 ARGB ≈ 0.5MB/帧，80 帧 ≈ 40MB，桌面端可接受 */
+    private static final int CACHE_CAPACITY = 80;
+
     private ObjectMapper objectMapper = new ObjectMapper();
     private List<DataChunk> allChunks;
     private List<DataChunk> chunks;
-    /** 预计算的二维码图标缓存（当前分片列表对应的图标） */
-    private List<ImageIcon> precomputedIcons;
-    /** 全部二维码图标缓存（筛选恢复时使用） */
-    private List<ImageIcon> allPrecomputedIcons;
+
+    /** LRU 图标缓存，键为 DataChunk.chunkIndex（在 allChunks 中稳定），跨筛选共享 */
+    private final Map<Integer, ImageIcon> iconCache = Collections.synchronizedMap(
+            new LinkedHashMap<Integer, ImageIcon>(CACHE_CAPACITY + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Integer, ImageIcon> eldest) {
+                    return size() > CACHE_CAPACITY;
+                }
+            }
+    );
+
+    /** 预取线程协调 */
+    private final Object prefetchLock = new Object();
+    private volatile int prefetchAnchor = 0;
+    private volatile boolean prefetchShutdown = false;
+    private Thread prefetchThread;
+
     /** 实际生成的二维码图片尺寸（像素） */
     private int actualQrWidth;
     private int actualQrHeight;
@@ -67,30 +85,93 @@ public class QRCodeGeneratorGUI extends JFrame {
     public QRCodeGeneratorGUI(List<DataChunk> chunks) {
         this.allChunks = new ArrayList<>(chunks);
         this.chunks = chunks;
-        precomputeAllQRCodes();
+        // 仅同步生成第 0 帧用于确定窗口尺寸；其余帧由后台预取线程懒生成
+        primeFirstFrame();
+        startPrefetchWorker();
         initUI();
         displayChunk(0);
         setupTimer();
     }
 
-    /** 预计算所有分片的二维码图标，避免播放时在EDT上做耗时运算 */
-    private void precomputeAllQRCodes() {
-        allPrecomputedIcons = new ArrayList<>(chunks.size());
-        for (int i = 0; i < chunks.size(); i++) {
-            try {
-                String json = objectMapper.writeValueAsString(chunks.get(i));
-                BufferedImage qrImage = generateQRCode(json);
-                if (i == 0) {
-                    actualQrWidth = qrImage.getWidth();
-                    actualQrHeight = qrImage.getHeight();
-                }
-                allPrecomputedIcons.add(new ImageIcon(qrImage));
-            } catch (Exception e) {
-                e.printStackTrace();
-                allPrecomputedIcons.add(null);
-            }
+    /** 同步生成第一帧，确定 QR 实际像素尺寸用于窗口布局 */
+    private void primeFirstFrame() {
+        try {
+            DataChunk first = chunks.get(0);
+            String json = objectMapper.writeValueAsString(first);
+            BufferedImage qrImage = generateQRCode(json);
+            actualQrWidth = qrImage.getWidth();
+            actualQrHeight = qrImage.getHeight();
+            iconCache.put(first.chunkIndex, new ImageIcon(qrImage));
+        } catch (Exception e) {
+            e.printStackTrace();
+            actualQrWidth = QR_SIZE;
+            actualQrHeight = QR_SIZE;
         }
-        precomputedIcons = allPrecomputedIcons;
+    }
+
+    /** 后台预取线程：保持 [anchor, anchor+PREFETCH_AHEAD) 范围内的帧已缓存 */
+    private void startPrefetchWorker() {
+        prefetchThread = new Thread(() -> {
+            while (!prefetchShutdown) {
+                int anchor = prefetchAnchor;
+                List<DataChunk> snapshot = chunks;
+                int total = snapshot.size();
+
+                for (int offset = 0; offset < PREFETCH_AHEAD && !prefetchShutdown; offset++) {
+                    // 用户跳转 / 筛选变更：放弃当前批，重新对齐
+                    if (prefetchAnchor != anchor || chunks != snapshot) break;
+
+                    int displayIdx = (anchor + offset) % total;
+                    DataChunk c = snapshot.get(displayIdx);
+                    if (!iconCache.containsKey(c.chunkIndex)) {
+                        try {
+                            String json = objectMapper.writeValueAsString(c);
+                            BufferedImage img = generateQRCode(json);
+                            iconCache.put(c.chunkIndex, new ImageIcon(img));
+                        } catch (Exception ex) {
+                            ex.printStackTrace();
+                        }
+                    }
+                }
+
+                synchronized (prefetchLock) {
+                    if (prefetchAnchor == anchor && chunks == snapshot && !prefetchShutdown) {
+                        try {
+                            prefetchLock.wait(500);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }
+            }
+        }, "qr-prefetch");
+        prefetchThread.setDaemon(true);
+        prefetchThread.start();
+    }
+
+    private void notifyPrefetch(int newAnchor) {
+        synchronized (prefetchLock) {
+            prefetchAnchor = newAnchor;
+            prefetchLock.notifyAll();
+        }
+    }
+
+    /** 获取展示索引对应的图标，缓存未命中时在调用线程同步生成 */
+    private ImageIcon getOrRenderIcon(int displayIndex) {
+        DataChunk c = chunks.get(displayIndex);
+        ImageIcon cached = iconCache.get(c.chunkIndex);
+        if (cached != null) return cached;
+        try {
+            String json = objectMapper.writeValueAsString(c);
+            BufferedImage img = generateQRCode(json);
+            ImageIcon icon = new ImageIcon(img);
+            iconCache.put(c.chunkIndex, icon);
+            return icon;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
     }
 
     private void initUI() {
@@ -290,6 +371,17 @@ public class QRCodeGeneratorGUI extends JFrame {
         mainPanel.add(rightPanel, BorderLayout.EAST);
 
         add(mainPanel);
+
+        // 窗口关闭时停止预取线程
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                prefetchShutdown = true;
+                synchronized (prefetchLock) {
+                    prefetchLock.notifyAll();
+                }
+            }
+        });
     }
 
     private void setupTimer() {
@@ -311,11 +403,14 @@ public class QRCodeGeneratorGUI extends JFrame {
     private void displayChunk(int index) {
         try {
             currentIndex = index;
-            qrImageLabel.setIcon(precomputedIcons.get(index));
+            qrImageLabel.setIcon(getOrRenderIcon(index));
 
             // 更新列表选中状态
             chunkList.setSelectedIndex(index);
             chunkList.ensureIndexIsVisible(index);
+
+            // 通知预取线程围绕新位置继续填充缓存
+            notifyPrefetch(index);
 
         } catch (Exception ex) {
             ex.printStackTrace();
@@ -447,18 +542,13 @@ public class QRCodeGeneratorGUI extends JFrame {
                 filteredChunks.add(allChunks.get(index - 1));
             }
 
-            // 更新chunks列表和图标缓存
+            // 切换 chunks 引用；图标缓存按原始 chunkIndex 索引，跨筛选自然复用
             this.chunks = filteredChunks;
-            List<ImageIcon> filteredIcons = new ArrayList<>();
-            for (int index : indices) {
-                filteredIcons.add(allPrecomputedIcons.get(index - 1));
-            }
-            this.precomputedIcons = filteredIcons;
 
             // 更新片段列表显示
             updateChunkList();
 
-            // 重置到第一个片段
+            // 重置到第一个片段，并通知预取线程重新对齐
             currentIndex = 0;
             displayChunk(0);
             if (timer != null) timer.restart();
@@ -471,9 +561,8 @@ public class QRCodeGeneratorGUI extends JFrame {
     }
 
     private void resetFilter() {
-        // 恢复所有片段和图标
+        // 恢复所有片段
         this.chunks = allChunks;
-        this.precomputedIcons = allPrecomputedIcons;
 
         // 更新片段列表显示（恢复原始格式）
         listModel.clear();
