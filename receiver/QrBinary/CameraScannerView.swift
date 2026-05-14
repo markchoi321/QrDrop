@@ -9,6 +9,7 @@ import SwiftUI
 import AVFoundation
 import Combine
 import Vision
+import QuartzCore
 
 struct CameraScannerView: View {
     @ObservedObject var receiver: FileReceiver
@@ -211,6 +212,10 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
     private var isRunning = false
     private var isProcessingVisionFrame = false
 
+    // 限帧到 ~15fps，降低 Vision ML 负载与发热（发送端最快 ~10fps，处理 30fps 是浪费）
+    private let minFrameInterval: CFTimeInterval = 1.0 / 15.0
+    private var lastFrameProcessedAt: CFTimeInterval = 0
+
     func start() {
         guard !isRunning else { return }
         isRunning = true
@@ -231,7 +236,8 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
 
     private func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .high
+        // 1KB QR (~37x37 模块) 在 720p 下每模块仍有 ~10px，识别裕量充足；相比 1080p 像素量减少 ~55%
+        session.sessionPreset = .hd1280x720
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
@@ -287,6 +293,11 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard !isProcessingVisionFrame else { return }
+
+        let now = CACurrentMediaTime()
+        if now - lastFrameProcessedAt < minFrameInterval { return }
+        lastFrameProcessedAt = now
+
         isProcessingVisionFrame = true
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
