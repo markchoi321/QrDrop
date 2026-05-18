@@ -236,8 +236,8 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
 
     private func configureSession() {
         session.beginConfiguration()
-        // 1KB QR (~37x37 模块) 在 720p 下每模块仍有 ~10px，识别裕量充足；相比 1080p 像素量减少 ~55%
-        session.sessionPreset = .hd1280x720
+        // 1080p：兼顾发送端屏幕不完美时的识别裕量；CPU 压力已由 15fps 限频 + 去重短路控制
+        session.sessionPreset = .hd1920x1080
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
