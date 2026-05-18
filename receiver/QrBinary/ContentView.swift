@@ -22,6 +22,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 enginePicker
 
+                scanSettings
+
                 controlSection
 
                 Divider()
@@ -71,6 +73,47 @@ struct ContentView: View {
         }
         .padding(.horizontal)
         .padding(.top, 12)
+        .padding(.bottom, 12)
+    }
+
+    // MARK: - 扫描设置（仅在启动扫描前生效）
+
+    private var scanSettings: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Text("分辨率")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("分辨率", selection: $receiver.scanResolution) {
+                    ForEach(ScanResolution.allCases) { res in
+                        Text(res.rawValue).tag(res)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            HStack(spacing: 12) {
+                Text("帧率")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // 5/10/15/20/25/30 六档，每档 5fps
+                Slider(
+                    value: Binding(
+                        get: { Double(receiver.maxScanFps) },
+                        set: { receiver.maxScanFps = Int($0) }
+                    ),
+                    in: 5...30,
+                    step: 5
+                )
+
+                Text("\(receiver.maxScanFps) fps")
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 56, alignment: .trailing)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal)
         .padding(.bottom, 12)
     }
 
