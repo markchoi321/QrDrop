@@ -27,7 +27,7 @@ struct CameraScannerView: View {
 
                 VStack {
                     HStack {
-                        Label("引擎: \(receiver.selectedEngine.rawValue)",
+                        Label("\(receiver.selectedEngine.rawValue) · \(receiver.scanResolution.rawValue) · \(receiver.maxScanFps)fps",
                               systemImage: receiver.selectedEngine == .vision ? "eye" : "camera.metering.center.weighted")
                         .font(.caption)
                         .padding(.horizontal, 12)
@@ -100,6 +100,8 @@ struct CameraScannerView: View {
             }
             .onAppear {
                 scanner.engine = receiver.selectedEngine
+                scanner.maxFps = receiver.maxScanFps
+                scanner.resolution = receiver.scanResolution
                 scanner.onQRCodeDetected = { [weak receiver] strings in
                     guard let receiver = receiver else { return }
                     Task { @MainActor in
@@ -204,6 +206,10 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
     let session = AVCaptureSession()
     var onQRCodeDetected: (([String]) -> Void)?
     var engine: QREngine = .avFoundation
+    /** 由调用方在 start() 之前设置，决定 Vision 帧处理的最大频率 */
+    var maxFps: Int = 20
+    /** 由调用方在 start() 之前设置，决定摄像头采集分辨率 */
+    var resolution: ScanResolution = .hd1080p
 
     private let metadataOutput = AVCaptureMetadataOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -212,13 +218,16 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
     private var isRunning = false
     private var isProcessingVisionFrame = false
 
-    // 限帧到 ~15fps，降低 Vision ML 负载与发热（发送端最快 ~10fps，处理 30fps 是浪费）
-    private let minFrameInterval: CFTimeInterval = 1.0 / 15.0
+    /** 帧间最小间隔，由 maxFps 推导；保护 Vision ML 不被 30fps 硬件帧率压垮 */
+    private var minFrameInterval: CFTimeInterval = 1.0 / 20.0
     private var lastFrameProcessedAt: CFTimeInterval = 0
 
     func start() {
         guard !isRunning else { return }
         isRunning = true
+
+        // 锁定本次会话使用的帧间隔，避免运行中被改动
+        minFrameInterval = 1.0 / Double(max(1, maxFps))
 
         sessionQueue.async { [weak self] in
             self?.configureSession()
@@ -236,8 +245,8 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
 
     private func configureSession() {
         session.beginConfiguration()
-        // 1KB QR (~37x37 模块) 在 720p 下每模块仍有 ~10px，识别裕量充足；相比 1080p 像素量减少 ~55%
-        session.sessionPreset = .hd1280x720
+        // 分辨率由用户在扫描前选择；CPU 压力由帧率限制 + 去重短路控制
+        session.sessionPreset = (resolution == .hd720p) ? .hd1280x720 : .hd1920x1080
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
