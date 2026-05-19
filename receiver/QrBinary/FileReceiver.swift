@@ -66,11 +66,11 @@ class FileReceiver: ObservableObject {
     @Published var files: [String: [Int: Data]] = [:]
     @Published var fileInfo: [String: FileInfo] = [:]
     @Published var logs: [LogEntry] = []
-    @Published var selectedEngine: QREngine = .avFoundation
+    @Published var selectedEngine: QREngine = .vision
     /** 扫描最大帧率，5/10/15/20/25/30 六档，默认 20fps */
     @Published var maxScanFps: Int = 20
-    /** 摄像头分辨率，默认 1080p */
-    @Published var scanResolution: ScanResolution = .hd1080p
+    /** 摄像头分辨率，默认 720p */
+    @Published var scanResolution: ScanResolution = .hd720p
 
     private var lastDecodeTime: [String: Date] = [:]
     // 已成功落盘的 QR payload 原始字符串集合，用于在 JSON 解析之前 O(1) 短路重复帧
