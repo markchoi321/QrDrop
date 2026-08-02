@@ -24,3 +24,6 @@ target/
 ### Node / Web ###
 node_modules/
 dist/
+
+### 设计文档与基准脚本（仅本地保留，不入库） ###
+docs/
