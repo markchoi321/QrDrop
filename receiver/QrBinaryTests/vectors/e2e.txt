@@ -1,0 +1,15 @@
+# 端到端 fixture 参数
+# 格式: <键> <值>
+fileName fixture.bin
+contentLen 20000
+contentSha256 e3d63172f944dc1fc8720d896d6d72af7d5d77929d6996790c7c0ddfbfe26ab2
+streamLen 20065
+streamSha256 941aa3418ece71b5317c424ebfa8be705a9e4321373c0713d935d0dd841a0801
+rlnc.T 51
+rlnc.K 394
+rlnc.m 57
+rlnc.sessionId cd4c97ad
+lt.T 293
+lt.K 69
+lt.m 10
+lt.sessionId 3059fd8a
