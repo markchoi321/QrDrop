@@ -1,0 +1,33 @@
+### macOS ###
+.DS_Store
+.AppleDouble
+.LSOverride
+
+### JetBrains ###
+.idea/
+*.iml
+*.iws
+*.ipr
+
+### VS Code ###
+.vscode/
+
+### Xcode ###
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+DerivedData/
+
+### Java / Maven ###
+target/
+
+### Node / Web ###
+node_modules/
+dist/
+
+### Python ###
+__pycache__/
+*.pyc
+
+### 设计文档与基准脚本（仅本地保留，不入库） ###
+docs/
