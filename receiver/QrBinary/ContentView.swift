@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var showCamera = false
     @State private var showPhotoPicker = false
     @State private var showLoadPicker = false
+    @State private var showClearConfirm = false
     @State private var expandedSessionId: UInt32?
 
     var body: some View {
@@ -179,12 +180,18 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
 
                 Button(role: .destructive) {
-                    receiver.clearProgressFiles()
+                    showClearConfirm = true
                 } label: {
                     Label("清理", systemImage: "trash")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .confirmationDialog("清空全部接收数据？", isPresented: $showClearConfirm, titleVisibility: .visible) {
+                    Button("清空", role: .destructive) { receiver.clearAll() }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("会话列表、传输进度与已接收的文件都会被删除，不可恢复。请先导出需要保留的文件。")
+                }
             }
         }
         .padding(.horizontal)

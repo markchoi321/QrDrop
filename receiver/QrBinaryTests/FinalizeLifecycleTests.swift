@@ -153,3 +153,80 @@ struct ManualFinalizeTests {
         #expect(blob.count > K * T, "序列化必须包含全部源块")
     }
 }
+
+// MARK: - 清理
+
+@MainActor
+struct ClearAllTests {
+
+    private var receivedDir: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("received", isDirectory: true)
+    }
+
+    /// 造一个进行中的会话，同时留下进度文件
+    private func seedSession(_ receiver: FileReceiver) throws -> UInt32 {
+        let stream = try Vectors.binary("stream.bin")
+        let e2e = try Vectors.keyValues("e2e.txt")
+        let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
+        let sid = UInt32(e2e["rlnc.sessionId"]!, radix: 16)!
+        let src = TestEncoder.splitSourceBlocks(stream, K: K, T: T)
+        let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .linearSolve,
+                                            compressed: false, sessionId: sid,
+                                            baseBlockId: 0, m: 8,
+                                            composer: LinearSolveComposer(K: K))
+        _ = receiver.processPayload(Data(bytes))
+        try ProgressStore.save(#require(receiver.sessions[sid]))
+        return sid
+    }
+
+    /// 清理必须真的清掉会话列表。
+    /// 早前按钮接的是只删磁盘进度文件的入口，内存里的 sessions 一个没动，
+    /// 界面看不出任何变化，而且 5 秒后的自动保存会把进度文件原样写回。
+    @Test func clearAllEmptiesSessionList() throws {
+        let receiver = FileReceiver()
+        let sid = try seedSession(receiver)
+        #expect(receiver.sessions[sid] != nil)
+        #expect(!receiver.sortedSessions.isEmpty)
+
+        receiver.clearAll()
+
+        #expect(receiver.sessions.isEmpty, "会话列表必须被清空")
+        #expect(receiver.sortedSessions.isEmpty)
+        #expect(receiver.legacyFiles.isEmpty)
+    }
+
+    /// 清理后重启不得把会话恢复回来：磁盘进度文件也必须一并删除
+    @Test func clearAllRemovesProgressFiles() throws {
+        let receiver = FileReceiver()
+        _ = try seedSession(receiver)
+        receiver.clearAll()
+
+        // 新实例走 restoreProgress，若进度文件还在就会把会话读回来
+        let reopened = FileReceiver()
+        #expect(reopened.sessions.isEmpty, "清理后重启不得恢复出会话")
+    }
+
+    /// 已落盘的最终文件也要删：会话记录没了之后，app 内再没有入口能访问到它们
+    @Test func clearAllRemovesReceivedFiles() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: receivedDir, withIntermediateDirectories: true)
+        let marker = receivedDir.appendingPathComponent("clear-test.bin")
+        try Data([1, 2, 3]).write(to: marker)
+        #expect(fm.fileExists(atPath: marker.path))
+
+        let receiver = FileReceiver()
+        receiver.clearAll()
+
+        #expect(!fm.fileExists(atPath: marker.path), "已接收文件必须一并删除")
+    }
+
+    /// 速率读数也要清零，否则清空后界面还挂着上次的速率
+    @Test func clearAllResetsThroughput() throws {
+        let receiver = FileReceiver()
+        _ = try seedSession(receiver)
+        #expect(receiver.throughput.bytesPerSecond(window: 5) > 0)
+        receiver.clearAll()
+        #expect(receiver.throughput.bytesPerSecond(window: 5) == 0)
+    }
+}

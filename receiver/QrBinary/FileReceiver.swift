@@ -491,17 +491,38 @@ class FileReceiver: ObservableObject {
 
     // MARK: - 清理
 
+    /// 清空全部接收数据：会话列表、旧格式文件、进度文件、已落盘的最终文件。
+    ///
+    /// 三处必须一起清。只删进度文件而留下内存里的 sessions，5 秒后的自动保存会把
+    /// 它们原样写回，等于没清；只清 sessions 而留下 received/ 下的最终文件，
+    /// 那些文件在 app 内再也没有入口可以访问到，只能占着空间。
     func clearAll() {
         sessions.removeAll()
         legacyFiles.removeAll()
         throughput.reset()
-        let n = ProgressStore.clearAll()
+        let progressCount = ProgressStore.clearAll()
+        let fileCount = FileReceiver.clearReceivedFiles()
         revision &+= 1
-        addLog("数据已清空，删除 \(n) 个进度文件")
+        addLog("数据已清空：\(progressCount) 个进度文件，\(fileCount) 个已接收文件")
     }
 
-    func clearProgressFiles() {
-        let n = ProgressStore.clearAll()
-        addLog("已清理 \(n) 个进度文件")
+    /// 删除 received/ 目录下已落盘的最终文件，返回删除个数
+    private static func clearReceivedFiles() -> Int {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("received", isDirectory: true)
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: dir,
+                                                                     includingPropertiesForKeys: nil) else {
+            return 0
+        }
+        var removed = 0
+        for url in urls {
+            do {
+                try FileManager.default.removeItem(at: url)
+                removed += 1
+            } catch {
+                continue
+            }
+        }
+        return removed
     }
 }
