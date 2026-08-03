@@ -73,8 +73,8 @@ SwiftUI + Vision 的 iOS 应用。摄像头连续扫描，可调分辨率（720p
 python3 protocol/refimpl.py check                      # 参考实现自检
 mvn -o -f sender/java/pom.xml test                     # Java 发送端向量比对
 node sender/web/test/run-vectors.js                    # Web 发送端向量比对
-xcodebuild test -project receiver/QrBinary.xcodeproj \
-  -scheme QrBinary -destination 'platform=iOS Simulator,name=iPhone 17'
+xcodebuild test -project receiver/QrDrop.xcodeproj \
+  -scheme QrDrop -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
 两端各自比对 `protocol/vectors/` 下的全部向量（PRNG、量化度分布、邻居集合、系数向量、选参、档位、整帧字节、raw deflate 往返），并各自跑 0/10/30/50% 丢帧的端到端还原与 SHA-256 校验。
@@ -96,6 +96,6 @@ python3 protocol/crosscheck.py <dump> --sha <原始文件sha256>
 本仓库由两个独立仓库合并而来，两侧历史完整保留，提交日期为原值：
 
 - 发送端源自 `markchoi321/Binary2QrCode`，历史路径已重写至 `sender/java/`
-- 接收端源自 `markchoi321/QrBinary`，历史路径已重写至 `receiver/`
+- 接收端源自 `markchoi321/QrDrop`，历史路径已重写至 `receiver/`
 
 合并前的基线见 tag `v0.1.0-baseline`。

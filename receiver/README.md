@@ -1,4 +1,4 @@
-# QrBinary
+# QrDrop
 
 iOS 端二维码文件接收器：通过摄像头连续扫描发送端（Binary2QrCode）滚动显示的 QR 序列，重组出原始二进制文件。
 
