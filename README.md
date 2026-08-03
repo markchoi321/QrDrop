@@ -12,12 +12,11 @@ VisionDrop/
 │   ├── crosscheck.py    跨语言校验：真实帧字节 -> 参考解码器 -> 比对哈希
 │   └── vectors/         测试向量，两端各自比对
 ├── sender/              发送端
-│   └── java/            Java Swing 桌面版
+│   ├── java/            Java Swing 桌面版
+│   └── web/             纯原生 HTML+JS 版（零依赖，兼容 IE10+ / Android 4+）
 ├── receiver/            接收端（iOS，SwiftUI + Vision）
 └── README.md
 ```
-
-`sender/web/`（html/js 技术栈）尚未开始，后续新增。
 
 ## 协议
 
@@ -47,6 +46,15 @@ Java 8+ / Maven / ZXing 3.5.1 的 Swing 桌面程序。三阶段流程：选择�
 
 详见 [sender/java/README.md](sender/java/README.md)。
 
+### 发送端 sender/web
+
+纯原生 HTML + JS，零依赖零构建，双击 `index.html` 即可运行。协议层与自研 QR
+编码器（字节模式 / ECC=L / V1–40）全部 ES5 实现，兼容 IE10+ / Android 4+ /
+iOS 6+。与桌面版的唯一语义差异是不做流层压缩（flag 恒为 0，契约允许）。
+播放游标存 localStorage，同一文件同参数重传自动续接。
+
+详见 [sender/web/README.md](sender/web/README.md)。
+
 ### 接收端 receiver
 
 SwiftUI + Vision 的 iOS 应用。摄像头连续扫描，可调分辨率（720p/1080p）与帧率上限（5–30fps），超出频率的相机回调直接丢弃以控制 ML 推理负载和发热。多会话并行维护，进度以二进制 `.vdpg` 格式自动落盘并在启动时恢复。
@@ -63,7 +71,8 @@ SwiftUI + Vision 的 iOS 应用。摄像头连续扫描，可调分辨率（720p
 
 ```bash
 python3 protocol/refimpl.py check                      # 参考实现自检
-mvn -o -f sender/java/pom.xml test                     # 发送端向量比对
+mvn -o -f sender/java/pom.xml test                     # Java 发送端向量比对
+node sender/web/test/run-vectors.js                    # Web 发送端向量比对
 xcodebuild test -project receiver/QrBinary.xcodeproj \
   -scheme QrBinary -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
@@ -81,7 +90,6 @@ python3 protocol/crosscheck.py <dump> --sha <原始文件sha256>
 ## 待办
 
 - 识别率标定（设计文档 11.1）：档位扫描 + 显示尺寸，决定 720p / 1080p 各自的可用档位上限
-- `sender/web/`
 
 ## 历史说明
 

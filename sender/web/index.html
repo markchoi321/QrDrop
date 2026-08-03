@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionDrop Web 发送端</title>
+<style>
+/* 只用老浏览器都支持的基础 CSS，不用 flex/grid 变量等新特性 */
+body { font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+       margin: 0; padding: 12px; background: #f4f4f4; color: #222; }
+h1 { font-size: 18px; margin: 0 0 10px 0; }
+.panel { background: #fff; border: 1px solid #ddd; padding: 10px;
+         margin-bottom: 10px; }
+.row { margin: 6px 0; }
+label { margin-right: 4px; }
+select, input, button { font-size: 14px; padding: 3px 6px; }
+button { cursor: pointer; margin-right: 6px; }
+#qrwrap { text-align: center; background: #fff; border: 1px solid #ddd;
+          padding: 8px 0; }
+#qrcanvas { background: #fff; }
+#info td { padding: 2px 10px 2px 0; font-size: 13px; }
+#stats { font-size: 13px; color: #444; }
+#err { color: #b00020; }
+.hint { color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>VisionDrop Web 发送端（协议 v1）</h1>
+
+<div class="panel">
+    <div class="row">
+        <input type="file" id="filepick">
+        <span id="err"></span>
+    </div>
+    <div class="row hint">
+        选择文件后自动完成选参并生成会话。Web 端不做压缩（流层 flag 恒为不压缩），
+        其余语义与桌面发送端一致，接收端无需区分。
+    </div>
+</div>
+
+<div class="panel" id="sesspanel" style="display:none">
+    <table id="info">
+        <tr><td>文件</td><td id="i_file"></td>
+            <td>大小</td><td id="i_size"></td></tr>
+        <tr><td>编码方案</td><td id="i_codec"></td>
+            <td>会话 sessionId</td><td id="i_sid"></td></tr>
+        <tr><td>块大小 T</td><td id="i_T"></td>
+            <td>源块数 K</td><td id="i_K"></td></tr>
+    </table>
+    <div class="row">
+        <label for="tier">档位</label>
+        <select id="tier"></select>
+        <label for="interval">间隔(ms)</label>
+        <input type="number" id="interval" value="150" min="30" step="10" style="width:70px">
+        <label><input type="checkbox" id="fastmask">固定掩码(低端设备提速)</label>
+    </div>
+    <div class="row">
+        <button id="btn_play">开始播放</button>
+        <button id="btn_reset">重置块序号</button>
+        <button id="btn_dump">导出帧转储</button>
+    </div>
+    <div class="row" id="stats"></div>
+</div>
+
+<div id="qrwrap" style="display:none">
+    <canvas id="qrcanvas" width="300" height="300"></canvas>
+</div>
+
+<script src="vd-protocol.js"></script>
+<script src="vd-qr.js"></script>
+<script>
+(function () {
+    "use strict";
+
+    /* 能力检测：老到没有 File API / 类型化数组的浏览器直接提示 */
+    var errEl = document.getElementById("err");
+    if (typeof Uint8Array === "undefined" || typeof FileReader === "undefined") {
+        errEl.innerHTML = "此浏览器过旧：缺少 File API 或类型化数组（需要 IE10+ / Android 4+ / Safari 5.1+）";
+        return;
+    }
+
+    var sess = null;          /* VDP.SendSession */
+    var tiers = [];
+    var tierIdx = 0;
+    var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进（对齐 PlaybackState 语义） */
+    var framesShown = 0;
+    var playing = false;
+    var timer = null;
+    var canvas = document.getElementById("qrcanvas");
+    var ctx = canvas.getContext("2d");
+
+    var $ = function (id) { return document.getElementById(id); };
+
+    /* ------------------------------------------------ 播放状态持久化 */
+
+    function stateKey() { return "vdweb." + VDP.sessionIdHex(sess.sid); }
+
+    function loadState() {
+        try {
+            var raw = window.localStorage.getItem(stateKey());
+            if (!raw) { return; }
+            var st = JSON.parse(raw);
+            nextBlockId = st.nextBlockId % 4294967296 || 0;
+            framesShown = st.framesShown || 0;
+            if (st.tier >= 0 && st.tier < tiers.length) { tierIdx = st.tier; }
+            if (st.intervalMs >= 30) { $("interval").value = st.intervalMs; }
+        } catch (e) { /* localStorage 不可用（如 file:// 下的老 IE）时静默跳过 */ }
+    }
+
+    function saveState() {
+        try {
+            window.localStorage.setItem(stateKey(), JSON.stringify({
+                nextBlockId: nextBlockId,
+                framesShown: framesShown,
+                tier: tierIdx,
+                intervalMs: parseInt($("interval").value, 10) || 150
+            }));
+        } catch (e) { /* 同上 */ }
+    }
+
+    /* ------------------------------------------------ 界面 */
+
+    function fmtSize(n) {
+        if (n < 1024) { return n + " B"; }
+        if (n < 1048576) { return (n / 1024).toFixed(1) + " KB"; }
+        return (n / 1048576).toFixed(2) + " MB";
+    }
+
+    function currentPassFrames() {
+        var m = tiers[tierIdx].m;
+        var eps = sess.codec === VDP.CODEC_RLNC ? VDP.epsRlnc(sess.K) : VDP.epsLt(sess.K);
+        return Math.ceil(Math.ceil(sess.K * (1 + eps)) / m);
+    }
+
+    function refreshStats() {
+        var pass = currentPassFrames();
+        $("stats").innerHTML = "已播帧数 " + framesShown +
+            " ｜ 下一块序号 " + nextBlockId +
+            " ｜ 当前档一轮约需 " + pass + " 帧" +
+            " ｜ 间隔 " + (parseInt($("interval").value, 10) || 150) + " ms";
+    }
+
+    function fillTierSelect() {
+        var sel = $("tier");
+        sel.innerHTML = "";
+        for (var i = 0; i < tiers.length; i++) {
+            var t = tiers[i];
+            var opt = document.createElement("option");
+            opt.value = i;
+            opt.text = "档" + (i + 1) + "  V" + t.version + "  每帧 " + t.m + " 块";
+            sel.appendChild(opt);
+        }
+        sel.selectedIndex = tierIdx;
+    }
+
+    /* ------------------------------------------------ 渲染 */
+
+    var MARGIN = 2;    /* 契约：margin 2 */
+
+    function drawFrame() {
+        var t = tiers[tierIdx];
+        var frame = sess.encodeFrame(nextBlockId, t.m);
+        var fixedMask = $("fastmask").checked ? (framesShown & 7) : undefined;
+        var qr = VDQR.encode(t.version, frame, fixedMask);
+        var n = qr.n;
+        /* 取窗口可用宽高的较小者，模块用整数像素避免糊边 */
+        var avail = Math.min(
+            (window.innerWidth || document.documentElement.clientWidth) - 40,
+            (window.innerHeight || document.documentElement.clientHeight) - 60);
+        if (avail < 100) { avail = 100; }
+        var px = Math.floor(avail / (n + MARGIN * 2));
+        if (px < 1) { px = 1; }
+        var size = (n + MARGIN * 2) * px;
+        canvas.width = size;
+        canvas.height = size;
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, size, size);
+        ctx.fillStyle = "#000";
+        for (var r = 0; r < n; r++) {
+            for (var c = 0; c < n; c++) {
+                if (qr.mat[r * n + c]) {
+                    ctx.fillRect((c + MARGIN) * px, (r + MARGIN) * px, px, px);
+                }
+            }
+        }
+        /* 帧显示成功后才推进游标（对齐 PlaybackState 语义） */
+        nextBlockId = (nextBlockId + t.m) % 4294967296;
+        framesShown++;
+    }
+
+    function tick() {
+        if (!playing) { return; }
+        var t0 = new Date().getTime();
+        try {
+            drawFrame();
+        } catch (e) {
+            stop();
+            errEl.innerHTML = "编码出错: " + e.message;
+            return;
+        }
+        refreshStats();
+        if (framesShown % 20 === 0) { saveState(); }
+        var interval = parseInt($("interval").value, 10) || 150;
+        var cost = new Date().getTime() - t0;
+        var wait = interval - cost;
+        if (wait < 0) { wait = 0; }
+        timer = window.setTimeout(tick, wait);
+    }
+
+    function play() {
+        if (!sess || playing) { return; }
+        playing = true;
+        $("btn_play").innerHTML = "暂停";
+        $("qrwrap").style.display = "";
+        tick();
+    }
+
+    function stop() {
+        playing = false;
+        $("btn_play").innerHTML = "开始播放";
+        if (timer) { window.clearTimeout(timer); timer = null; }
+        saveState();
+    }
+
+    /* ------------------------------------------------ 帧转储导出（契约 14） */
+
+    function exportDump() {
+        if (!sess) { return; }
+        var t = tiers[tierIdx];
+        var count = currentPassFrames();
+        var parts = [];
+        var total = 0;
+        var base = 0;
+        for (var f = 0; f < count; f++) {
+            var frame = sess.encodeFrame(base, t.m);
+            var rec = new Uint8Array(4 + frame.length);
+            rec[0] = (frame.length >>> 24) & 0xFF;
+            rec[1] = (frame.length >>> 16) & 0xFF;
+            rec[2] = (frame.length >>> 8) & 0xFF;
+            rec[3] = frame.length & 0xFF;
+            rec.set(frame, 4);
+            parts.push(rec);
+            total += rec.length;
+            base = (base + t.m) % 4294967296;
+        }
+        var all = new Uint8Array(total);
+        var off = 0;
+        for (var i = 0; i < parts.length; i++) { all.set(parts[i], off); off += parts[i].length; }
+        var name = VDP.sessionIdHex(sess.sid) + ".vddump";
+        try {
+            var blob = new Blob([all], { type: "application/octet-stream" });
+            if (window.navigator.msSaveBlob) {          /* IE10/11 */
+                window.navigator.msSaveBlob(blob, name);
+                return;
+            }
+            var a = document.createElement("a");
+            a.href = (window.URL || window.webkitURL).createObjectURL(blob);
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } catch (e) {
+            errEl.innerHTML = "此浏览器不支持文件导出";
+        }
+    }
+
+    /* ------------------------------------------------ 事件 */
+
+    $("filepick").addEventListener("change", function () {
+        var f = this.files && this.files[0];
+        if (!f) { return; }
+        stop();
+        errEl.innerHTML = "";
+        var reader = new FileReader();
+        reader.onload = function () {
+            try {
+                var content = new Uint8Array(reader.result);
+                sess = new VDP.SendSession(content, f.name);
+            } catch (e) {
+                errEl.innerHTML = "会话创建失败: " + e.message;
+                return;
+            }
+            tiers = sess.tiers;
+            tierIdx = Math.floor((tiers.length - 1) / 2);
+            nextBlockId = 0;
+            framesShown = 0;
+            loadState();          /* 同一文件同参数重传时续接游标 */
+            fillTierSelect();
+            $("i_file").innerHTML = sess.fileName;
+            $("i_size").innerHTML = fmtSize(sess.contentLen) +
+                "（流层 " + fmtSize(sess.stream.length) + "）";
+            $("i_codec").innerHTML = sess.codec === VDP.CODEC_RLNC ? "解方程(RLNC)" : "剥洋葱(LT)";
+            $("i_sid").innerHTML = VDP.sessionIdHex(sess.sid);
+            $("i_T").innerHTML = sess.T;
+            $("i_K").innerHTML = sess.K;
+            $("sesspanel").style.display = "";
+            refreshStats();
+        };
+        reader.onerror = function () { errEl.innerHTML = "文件读取失败"; };
+        reader.readAsArrayBuffer(f);
+    });
+
+    $("btn_play").addEventListener("click", function () {
+        if (playing) { stop(); } else { play(); }
+    });
+
+    $("btn_reset").addEventListener("click", function () {
+        nextBlockId = 0;
+        framesShown = 0;
+        saveState();
+        refreshStats();
+    });
+
+    $("btn_dump").addEventListener("click", exportDump);
+
+    $("tier").addEventListener("change", function () {
+        /* 换档只改 m：T/K/codec/sessionId 不变，游标继续推进（契约 9） */
+        tierIdx = this.selectedIndex;
+        saveState();
+        refreshStats();
+    });
+
+    $("interval").addEventListener("change", function () {
+        saveState();
+        refreshStats();
+    });
+})();
+</script>
+</body>
+</html>
