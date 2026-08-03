@@ -17,8 +17,10 @@ struct CameraScannerView: View {
     @StateObject private var scanner = CameraScanner()
 
     @State private var lastReceivedInfo: String = ""
-    @State private var rate1s: Double = 0
-    @State private var rate5s: Double = 0
+    /// 接收速率与识别帧率，窗口均为最近 1 秒
+    @State private var rate: Double = 0
+    @State private var detectedFps: Double = 0
+    @State private var processedFps: Double = 0
 
     /// 速率需要在没有新帧时也归零，因此单独定时刷新，不能只靠 receiver 的变更驱动。
     ///
@@ -108,13 +110,20 @@ struct CameraScannerView: View {
                             }
                             .foregroundStyle(.white)
 
-                            // 速率按去重后的编码块字节数计，重复帧不计入
+                            // 两个读数互补：帧率含重复识别，反映识别能力本身；
+                            // 速率按去重后的编码块字节数计，反映净进度。
                             HStack(spacing: 6) {
+                                Image(systemName: "viewfinder")
+                                    .font(.caption2)
+                                Text("\(ThroughputMeter.formatFps(detectedFps)) fps")
+                                if scanner.reportsProcessedFps {
+                                    Text("/ 送检 \(ThroughputMeter.formatFps(processedFps))")
+                                        .foregroundStyle(.white.opacity(0.6))
+                                }
+                                Text("·")
                                 Image(systemName: "speedometer")
                                     .font(.caption2)
-                                Text("1s \(ThroughputMeter.format(rate1s))")
-                                Text("·")
-                                Text("5s \(ThroughputMeter.format(rate5s))")
+                                Text(ThroughputMeter.format(rate))
                             }
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.white.opacity(0.9))
@@ -194,8 +203,9 @@ struct CameraScannerView: View {
                 Task { @MainActor in receiver.saveAllProgress(force: true) }
             }
             .onReceive(rateTimer) { _ in
-                rate1s = receiver.throughput.bytesPerSecond(window: 1)
-                rate5s = receiver.throughput.bytesPerSecond(window: 5)
+                rate = receiver.throughput.bytesPerSecond()
+                detectedFps = scanner.detectedMeter.perSecond()
+                processedFps = scanner.processedMeter.perSecond()
             }
         }
     }
@@ -260,6 +270,15 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
     /** 由调用方在 start() 之前设置，决定摄像头采集分辨率 */
     var resolution: ScanResolution = .hd1080p
 
+    /// 送检帧率：真正交给识别器的帧数。只有 Vision 路径能统计，
+    /// AVFoundation 在采集管线内部检测，不出码时没有任何回调，拿不到分母。
+    let processedMeter = ThroughputMeter()
+    /// 命中帧率：识别出至少一个二维码的帧数。两种引擎都能统计。
+    let detectedMeter = ThroughputMeter()
+
+    /// 送检帧率是否可用，决定界面是否显示该读数
+    var reportsProcessedFps: Bool { engine == .vision }
+
     private let metadataOutput = AVCaptureMetadataOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
@@ -279,6 +298,8 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
 
         // 锁定本次会话使用的帧间隔，避免运行中被改动
         minFrameInterval = 1.0 / Double(max(1, maxFps))
+        processedMeter.reset()
+        detectedMeter.reset()
 
         sessionQueue.async { [weak self] in
             self?.configureSession()
@@ -389,7 +410,10 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
             return FileReceiver.rawPayload(descriptor: readableObj.descriptor as? CIQRCodeDescriptor,
                                            fallbackString: readableObj.stringValue)
         }
-        if !payloads.isEmpty { deliver(payloads) }
+        if !payloads.isEmpty {
+            detectedMeter.record()
+            deliver(payloads)
+        }
     }
 
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate (Vision)
@@ -410,6 +434,10 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
             return
         }
 
+        // 通过限流、确实要跑推理的帧才计入送检；被 minFrameInterval 或
+        // isProcessingVisionFrame 挡掉的帧不算，否则读数恒等于相机硬件帧率
+        processedMeter.record()
+
         let request = VNDetectBarcodesRequest { [weak self] request, error in
             defer { self?.isProcessingVisionFrame = false }
             guard let results = request.results as? [VNBarcodeObservation] else { return }
@@ -417,7 +445,10 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
                 guard observation.symbology == .qr else { return nil }
                 return FileReceiver.rawPayload(of: observation)
             }
-            if !payloads.isEmpty { self?.deliver(payloads) }
+            if !payloads.isEmpty {
+                self?.detectedMeter.record()
+                self?.deliver(payloads)
+            }
         }
         request.symbologies = [.qr]
 

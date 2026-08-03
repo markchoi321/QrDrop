@@ -225,8 +225,8 @@ struct ClearAllTests {
     @Test func clearAllResetsThroughput() throws {
         let receiver = FileReceiver()
         _ = try seedSession(receiver)
-        #expect(receiver.throughput.bytesPerSecond(window: 5) > 0)
+        #expect(receiver.throughput.bytesPerSecond() > 0)
         receiver.clearAll()
-        #expect(receiver.throughput.bytesPerSecond(window: 5) == 0)
+        #expect(receiver.throughput.bytesPerSecond() == 0)
     }
 }
