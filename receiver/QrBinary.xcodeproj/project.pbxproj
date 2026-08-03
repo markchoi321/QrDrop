@@ -124,6 +124,7 @@
 				572642BF2F4A045D00E5DE0F /* Sources */,
 				572642C02F4A045D00E5DE0F /* Frameworks */,
 				572642C12F4A045D00E5DE0F /* Resources */,
+				57A0FE012F4A0A0100E5DE0F /* Verify Protocol Vectors */,
 			);
 			buildRules = (
 			);
@@ -230,6 +231,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		57A0FE012F4A0A0100E5DE0F /* Verify Protocol Vectors */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Verify Protocol Vectors";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# 校验 QrBinaryTests/vectors 与 protocol/vectors 一致，防止两份副本漂移\nset -e\nSRC=\"${SRCROOT}/../protocol/vectors\"\nDST=\"${SRCROOT}/QrBinaryTests/vectors\"\nif [ -d \"$SRC\" ]; then\n  if ! diff -r \"$SRC\" \"$DST\" > /dev/null 2>&1; then\n    echo \"error: QrBinaryTests/vectors 与 protocol/vectors 不一致，请执行 cp protocol/vectors/* receiver/QrBinaryTests/vectors/\"\n    exit 1\n  fi\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		572642B22F4A045B00E5DE0F /* Sources */ = {
@@ -473,6 +496,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = F89HZ229CU;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
 				MARKETING_VERSION = 1.0;
@@ -495,6 +519,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = F89HZ229CU;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.4;
 				MARKETING_VERSION = 1.0;
