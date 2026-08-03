@@ -19,13 +19,13 @@ import java.util.Properties;
  * 否则换档时作废的那些 blockId 会在序列里留下永远不出现的空洞，
  * 破坏 11.1 标定中"由 maxBlockId / m 反推已播帧数"的公式。
  *
- * 以 sessionId 为键持久化到 ~/.visiondrop/playback/<sessionId>.state，
+ * 以 sessionId 为键持久化到 ~/.qrdrop/playback/<sessionId>.state，
  * 重启后同一文件推导出同一 sessionId，游标从上次位置续推。
  */
 public class PlaybackState {
 
     /** 状态目录 */
-    private static final String DIR_NAME = ".visiondrop" + File.separator + "playback";
+    private static final String DIR_NAME = ".qrdrop" + File.separator + "playback";
 
     public final int sessionId;
     /** 块序号游标，仅在帧真正显示后推进 */
@@ -114,7 +114,7 @@ public class PlaybackState {
             p.setProperty("m", Integer.toString(m));
             p.setProperty("intervalMs", Integer.toString(intervalMs));
             w = new OutputStreamWriter(new FileOutputStream(f), "UTF-8");
-            p.store(w, "VisionDrop 发送端播放状态");
+            p.store(w, "QrDrop 发送端播放状态");
         } catch (IOException e) {
             System.err.println("警告: 播放状态保存失败 " + e.getMessage());
         } finally {

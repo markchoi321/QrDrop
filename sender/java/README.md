@@ -1,4 +1,4 @@
-# VisionDrop 发送端（Java）
+# QrDrop 发送端（Java）
 
 把文件编码成无限的二维码帧流播放出去，接收端用相机扫。协议语义以
 `protocol/CONTRACT.md` 为唯一权威，`protocol/refimpl.py` 是参考实现，
@@ -36,7 +36,7 @@ java -cp target/classes:<zxing jar> org.file.qrcode.QRCodeGeneratorGUI 文件1 [
 得知后者。主指标以**编码块**计而不以帧计：换档会改变每帧块数 `m`，以帧计的百分比会跳变。
 
 播放游标 `nextBlockId` 只在帧真正显示后推进（预取生成的帧不推进），以 `sessionId` 为键
-持久化在 `~/.visiondrop/playback/<sessionId>.state`，重启后同一文件推导出同一 sessionId，
+持久化在 `~/.qrdrop/playback/<sessionId>.state`，重启后同一文件推导出同一 sessionId，
 游标从上次位置续推。
 
 ## 代码结构

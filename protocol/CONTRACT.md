@@ -1,4 +1,4 @@
-# VisionDrop 协议 v1 实现契约
+# QrDrop 协议 v1 实现契约
 
 本文件把 `docs/refactor-design.md` 中未完全确定的算法细节固定下来，是发送端（Java）与
 接收端（Swift）唯一的权威语义来源。凡设计文档与本文件冲突，以本文件为准，冲突点在

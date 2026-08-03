@@ -292,7 +292,7 @@ struct ContentView: View {
         do {
             let data = try receiver.encodeProgress()
             let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("visiondrop_\(Int(Date().timeIntervalSince1970)).vdpg")
+                .appendingPathComponent("qrdrop_\(Int(Date().timeIntervalSince1970)).vdpg")
             try data.write(to: tempURL)
             receiver.addLog("进度已准备导出（\(data.count) 字节）")
             share(tempURL)

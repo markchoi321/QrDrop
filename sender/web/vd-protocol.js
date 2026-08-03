@@ -1,5 +1,5 @@
 /*
- * VisionDrop 协议 v1 —— Web 发送端协议层（纯 ES5，无任何依赖）
+ * QrDrop 协议 v1 —— Web 发送端协议层（纯 ES5，无任何依赖）
  *
  * 语义与 protocol/CONTRACT.md、protocol/refimpl.py 逐位一致，
  * 验收方式是 test/run-vectors.js 对 protocol/vectors/ 的全量比对。

@@ -29,7 +29,7 @@ final class VectorBundleAnchor {}
 
 /// 把实测 ε 等关键数字写到宿主机 /private/tmp，便于抓取（Xcode 控制台同时可见）
 enum TestReport {
-    static let path = "/private/tmp/visiondrop-tests.log"
+    static let path = "/private/tmp/qrdrop-tests.log"
 
     static func log(_ line: String) {
         print(line)

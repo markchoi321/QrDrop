@@ -1,11 +1,11 @@
-# VisionDrop
+# QrDrop
 
 通过屏幕与摄像头之间的单向光学信道传输文件：发送端把文件编码成滚动播放的二维码序列，接收端用摄像头连续扫描并重组出原始二进制文件。全程不依赖网络、蓝牙、配对或可移动介质，适用于物理隔离环境。
 
 ## 仓库结构
 
 ```
-VisionDrop/
+QrDrop/
 ├── protocol/            协议契约、参考实现与跨语言测试向量
 │   ├── CONTRACT.md      两端实现的唯一权威
 │   ├── refimpl.py       Python 参考实现（编解码 + 选参 + 档位）
@@ -96,6 +96,6 @@ python3 protocol/crosscheck.py <dump> --sha <原始文件sha256>
 本仓库由两个独立仓库合并而来，两侧历史完整保留，提交日期为原值：
 
 - 发送端源自 `markchoi321/Binary2QrCode`，历史路径已重写至 `sender/java/`
-- 接收端源自 `markchoi321/QrDrop`，历史路径已重写至 `receiver/`
+- 接收端源自 `markchoi321/QrBinary`（后更名 QrDrop），历史路径已重写至 `receiver/`
 
 合并前的基线见 tag `v0.1.0-baseline`。

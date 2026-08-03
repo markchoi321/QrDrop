@@ -30,7 +30,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * VisionDrop 发送端界面（设计第 10 章）。
+ * QrDrop 发送端界面（设计第 10 章）。
  *
  * 三阶段流程：① 选择文件（会话参数锁定）→ ② 对焦对齐（静止单帧）→ ③ 播放（无限帧流）。
  * 喷泉码下"第 N 片"的概念不存在，片段列表 / 上一个 / 下一个 / 片段筛选已全部移除。
@@ -215,7 +215,7 @@ public class QRCodeGeneratorGUI extends JFrame {
     // ------------------------------------------------------------ 界面构建
 
     private void initUI() {
-        setTitle("VisionDrop 发送端");
+        setTitle("QrDrop 发送端");
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setSize(1080, 760);
         setLocationRelativeTo(null);

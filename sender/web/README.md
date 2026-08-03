@@ -1,4 +1,4 @@
-# VisionDrop Web 发送端
+# QrDrop Web 发送端
 
 纯原生 HTML + JS 实现的发送端，零依赖、零构建，双击 `index.html` 即可运行
 （或任意静态服务器托管）。协议语义与 `protocol/CONTRACT.md` 逐位一致。

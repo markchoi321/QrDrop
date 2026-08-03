@@ -1,5 +1,5 @@
 /*
- * VisionDrop Web 发送端 —— QR 编码器（纯 ES5，无任何依赖）
+ * QrDrop Web 发送端 —— QR 编码器（纯 ES5，无任何依赖）
  *
  * 只实现本协议需要的子集：字节模式、ECC=L、版本 1–40、不设 ECI/字符集提示。
  * 分块表由 QR 规范第一性推导并与项目容量表（refimpl.py QR_CAPACITY）逐版本
