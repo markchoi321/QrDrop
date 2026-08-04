@@ -17,10 +17,16 @@ select, input, button { font-size: 14px; padding: 3px 6px; }
 button { cursor: pointer; margin-right: 6px; }
 #qrwrap { text-align: center; background: #fff; border: 1px solid #ddd;
           padding: 8px 0; }
+/* 关键：canvas 及其容器禁止任何 CSS 过渡与动画。
+   合成器一旦对 opacity/transform 做插值，就会自行生成中间帧，
+   接收端会拍到两帧混合的废帧。此处显式锁死，勿删。 */
+#qrwrap, #qrcanvas { transition: none !important; animation: none !important; }
 #qrcanvas { background: #fff; }
 #info td { padding: 2px 10px 2px 0; font-size: 13px; }
 #stats { font-size: 13px; color: #444; }
+#health { font-size: 13px; color: #444; }
 #err { color: #b00020; }
+.warn { color: #a06000; }
 .hint { color: #888; font-size: 12px; }
 </style>
 </head>
@@ -51,8 +57,9 @@ button { cursor: pointer; margin-right: 6px; }
         <label for="tier">档位</label>
         <select id="tier"></select>
         <label for="interval">间隔(ms)</label>
-        <input type="number" id="interval" value="150" min="30" step="10" style="width:70px">
-        <label><input type="checkbox" id="fastmask">固定掩码(低端设备提速)</label>
+        <input type="number" id="interval" value="150" min="8" step="1" style="width:70px">
+        <label><input type="checkbox" id="fastmask">快速掩码(高帧率自动启用)</label>
+        <label><input type="checkbox" id="autoslow" checked>掉帧自动降速</label>
     </div>
     <div class="row">
         <button id="btn_play">开始播放</button>
@@ -60,6 +67,7 @@ button { cursor: pointer; margin-right: 6px; }
         <button id="btn_dump">导出帧转储</button>
     </div>
     <div class="row" id="stats"></div>
+    <div class="row" id="health"></div>
 </div>
 
 <div id="qrwrap" style="display:none">
@@ -82,14 +90,23 @@ button { cursor: pointer; margin-right: 6px; }
     var sess = null;          /* VDP.SendSession */
     var tiers = [];
     var tierIdx = 0;
-    var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进（对齐 PlaybackState 语义） */
+    var nextBlockId = 0;      /* 已上屏游标：只在帧确认上屏后推进（对齐 PlaybackState 语义） */
     var framesShown = 0;
     var playing = false;
-    var timer = null;
+    var timer = null;         /* 降级路径的 setTimeout 句柄 */
     var canvas = document.getElementById("qrcanvas");
     var ctx = canvas.getContext("2d");
 
     var $ = function (id) { return document.getElementById(id); };
+
+    /* rAF 与高精度计时的兼容取用；缺失则走 setTimeout 降级路径 */
+    var raf = window.requestAnimationFrame || window.webkitRequestAnimationFrame ||
+              window.mozRequestAnimationFrame || window.msRequestAnimationFrame || null;
+    var caf = window.cancelAnimationFrame || window.webkitCancelAnimationFrame ||
+              window.mozCancelAnimationFrame || window.msCancelAnimationFrame || null;
+    var nowFn = (window.performance && window.performance.now) ?
+                function () { return window.performance.now(); } :
+                function () { return new Date().getTime(); };
 
     /* ------------------------------------------------ 播放状态持久化 */
 
@@ -103,7 +120,7 @@ button { cursor: pointer; margin-right: 6px; }
             nextBlockId = st.nextBlockId % 4294967296 || 0;
             framesShown = st.framesShown || 0;
             if (st.tier >= 0 && st.tier < tiers.length) { tierIdx = st.tier; }
-            if (st.intervalMs >= 30) { $("interval").value = st.intervalMs; }
+            if (st.intervalMs >= 8) { $("interval").value = st.intervalMs; }
         } catch (e) { /* localStorage 不可用（如 file:// 下的老 IE）时静默跳过 */ }
     }
 
@@ -126,6 +143,11 @@ button { cursor: pointer; margin-right: 6px; }
         return (n / 1048576).toFixed(2) + " MB";
     }
 
+    function intervalMs() {
+        var v = parseInt($("interval").value, 10);
+        return v >= 8 ? v : 150;
+    }
+
     function currentPassFrames() {
         var m = tiers[tierIdx].m;
         var eps = sess.codec === VDP.CODEC_RLNC ? VDP.epsRlnc(sess.K) : VDP.epsLt(sess.K);
@@ -133,11 +155,33 @@ button { cursor: pointer; margin-right: 6px; }
     }
 
     function refreshStats() {
+        if (!sess) { return; }
         var pass = currentPassFrames();
         $("stats").innerHTML = "已播帧数 " + framesShown +
             " ｜ 下一块序号 " + nextBlockId +
             " ｜ 当前档一轮约需 " + pass + " 帧" +
-            " ｜ 间隔 " + (parseInt($("interval").value, 10) || 150) + " ms";
+            " ｜ 间隔 " + intervalMs() + " ms";
+    }
+
+    function refreshHealth() {
+        if (!raf) {
+            $("health").innerHTML = "降级路径：本浏览器无 requestAnimationFrame，" +
+                "帧边界不与刷新同步，高帧率下可能产生撕裂帧";
+            return;
+        }
+        var fps = 1000 / (hold * vsyncMs);
+        var txt = "刷新周期 " + vsyncMs.toFixed(2) + " ms" +
+            " ｜ 每帧保持 " + hold + " 个周期（实际 " + fps.toFixed(1) + " fps）" +
+            " ｜ 缓冲 " + ringCount() + "/" + (RING_SIZE - 1) +
+            " ｜ 掉帧 " + missedTotal + " ｜ 缺帧等待 " + starveTotal;
+        if (hold > baseHold) {
+            txt += " <span class='warn'>已自动降速：设备产不出目标帧率</span>";
+        }
+        if (stallTotal > 0) {
+            txt += " <span class='warn'>页面被挂起过 " + stallTotal +
+                " 次（切后台/锁屏会暂停播放，回到前台自动续上）</span>";
+        }
+        $("health").innerHTML = txt;
     }
 
     function fillTierSelect() {
@@ -153,17 +197,16 @@ button { cursor: pointer; margin-right: 6px; }
         sel.selectedIndex = tierIdx;
     }
 
-    /* ------------------------------------------------ 渲染 */
+    /* ------------------------------------------------ 布局（只在换档/缩放时做） */
 
-    var MARGIN = 2;    /* 契约：margin 2 */
+    var MARGIN = 2;           /* 契约：margin 2 */
+    var modN = 0;             /* 当前档模块数 */
+    var modPx = 1;            /* 每模块像素 */
+    var canvasSize = 300;
 
-    function drawFrame() {
+    function layout() {
         var t = tiers[tierIdx];
-        var frame = sess.encodeFrame(nextBlockId, t.m);
-        var fixedMask = $("fastmask").checked ? (framesShown & 7) : undefined;
-        var qr = VDQR.encode(t.version, frame, fixedMask);
-        var n = qr.n;
-        /* 取窗口可用宽高的较小者，模块用整数像素避免糊边 */
+        var n = 17 + 4 * t.version;
         var avail = Math.min(
             (window.innerWidth || document.documentElement.clientWidth) - 40,
             (window.innerHeight || document.documentElement.clientHeight) - 60);
@@ -171,40 +214,262 @@ button { cursor: pointer; margin-right: 6px; }
         var px = Math.floor(avail / (n + MARGIN * 2));
         if (px < 1) { px = 1; }
         var size = (n + MARGIN * 2) * px;
-        canvas.width = size;
-        canvas.height = size;
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(0, 0, size, size);
-        ctx.fillStyle = "#000";
-        for (var r = 0; r < n; r++) {
-            for (var c = 0; c < n; c++) {
-                if (qr.mat[r * n + c]) {
-                    ctx.fillRect((c + MARGIN) * px, (r + MARGIN) * px, px, px);
-                }
-            }
+        modN = n;
+        modPx = px;
+        /* 只有尺寸真的变了才碰 canvas.width：赋值即重建后备缓冲并触发布局，
+           放进播放循环会成为每帧的抖动源 */
+        if (size !== canvasSize || canvas.width !== size) {
+            canvasSize = size;
+            canvas.width = size;
+            canvas.height = size;
         }
-        /* 帧显示成功后才推进游标（对齐 PlaybackState 语义） */
-        nextBlockId = (nextBlockId + t.m) % 4294967296;
-        framesShown++;
+        ringReset();
     }
 
-    function tick() {
+    /* ------------------------------------------------ 帧环形缓冲（预渲染） */
+
+    var RING_SIZE = 12;       /* 实际可用 RING_SIZE-1，留一格区分空与满 */
+    var ring = [];            /* 每项 { cv, ct, blockId, m } */
+    var ringHead = 0;         /* 下一个取出位置 */
+    var ringTail = 0;         /* 下一个写入位置 */
+    var fillBlockId = 0;      /* 预渲染填充游标，可跑在 nextBlockId 前面 */
+    var fillSeq = 0;          /* 预渲染序号，仅用于快速掩码轮换 */
+
+    function ringCount() {
+        return (ringTail - ringHead + RING_SIZE) % RING_SIZE;
+    }
+
+    function ringReset() {
+        ringHead = 0;
+        ringTail = 0;
+        /* 丢弃所有预渲染帧，填充游标回退到已上屏游标，保证 blockId 序列无空洞 */
+        fillBlockId = nextBlockId;
+        fillSeq = framesShown;
+        for (var i = 0; i < RING_SIZE; i++) {
+            if (!ring[i]) {
+                ring[i] = { cv: document.createElement("canvas"), ct: null, blockId: 0, m: 0 };
+                ring[i].ct = ring[i].cv.getContext("2d");
+            }
+            if (ring[i].cv.width !== canvasSize) {
+                ring[i].cv.width = canvasSize;
+                ring[i].cv.height = canvasSize;
+            }
+        }
+    }
+
+    /* 高帧率下八种掩码全评估太贵（每帧 8 次矩阵构建 + 罚分），
+       会把预渲染本身变成掉帧源。解码端对掩码无偏好，故按帧轮换固定掩码。 */
+    function fastMaskOn() {
+        return $("fastmask").checked || hold <= 2;
+    }
+
+    /* 把一帧编码并光栅化进环形缓冲的下一个空位 */
+    function fillOne() {
+        var t = tiers[tierIdx];
+        var slot = ring[ringTail];
+        var frame = sess.encodeFrame(fillBlockId, t.m);
+        var mask = fastMaskOn() ? (fillSeq & 7) : undefined;
+        var qr = VDQR.encode(t.version, frame, mask);
+        var n = qr.n;
+        var g = slot.ct;
+        var px = modPx;
+        g.fillStyle = "#fff";
+        g.fillRect(0, 0, canvasSize, canvasSize);
+        g.fillStyle = "#000";
+        /* 按行合并横向连续的黑模块，把 fillRect 调用数从 n*n 降到行程数量级 */
+        for (var r = 0; r < n; r++) {
+            var c = 0;
+            while (c < n) {
+                if (!qr.mat[r * n + c]) { c++; continue; }
+                var s = c;
+                while (c < n && qr.mat[r * n + c]) { c++; }
+                g.fillRect((s + MARGIN) * px, (r + MARGIN) * px, (c - s) * px, px);
+            }
+        }
+        slot.blockId = fillBlockId;
+        slot.m = t.m;
+        ringTail = (ringTail + 1) % RING_SIZE;
+        fillBlockId = (fillBlockId + t.m) % 4294967296;
+        fillSeq++;
+    }
+
+    /* 冷启动时同步填一批，避免开局就饥饿 */
+    function prefill(n) {
+        for (var i = 0; i < n && ringCount() < RING_SIZE - 1; i++) { fillOne(); }
+    }
+
+    /* ------------------------------------------------ 呈现与上屏确认 */
+
+    var pending = null;       /* 已提交给合成器、等待下一次 rAF 确认上屏的帧 */
+
+    /* 只做一次 blit。整条播放路径上唯一触碰主画布的地方。 */
+    function present() {
+        if (ringCount() === 0) { return false; }
+        var slot = ring[ringHead];
+        ctx.drawImage(slot.cv, 0, 0);
+        ringHead = (ringHead + 1) % RING_SIZE;
+        pending = slot;
+        return true;
+    }
+
+    /* rAF 回调再次触发，说明上一次回调里的绘制已经过一个 vsync 合成上屏。
+       游标在此刻推进，而不是 drawImage 返回时——后者只代表命令入队。
+       pending 指向的槽在确认前不会被 fillOne 覆写：写入位置等于刚释放的槽时
+       ringCount 必为 RING_SIZE-1，而填充判据要求严格小于该值，故被挡住。
+       这条不变式依赖"环形缓冲永远空一格"的约定，改 RING_SIZE 判据时勿破坏。 */
+    function commitPending() {
+        if (!pending) { return; }
+        nextBlockId = (pending.blockId + pending.m) % 4294967296;
+        framesShown++;
+        pending = null;
+        if (framesShown % 120 === 0) { saveState(); }
+    }
+
+    /* ------------------------------------------------ vsync 测量与背压 */
+
+    var vsyncMs = 16.7;
+    var vsLocked = false;
+    var vsSamples = [];
+    var reSamples = [];       /* 锁定后的滚动样本，用于重新测量 */
+    var hold = 1;             /* 每帧占用的刷新周期数，整数保证帧边界对齐 vsync */
+    var baseHold = 1;         /* 由间隔换算的目标值，背压只在其之上加 */
+    var vsyncCount = 0;
+    var lastTs = 0;
+    var missedTotal = 0;
+    var starveTotal = 0;
+    var stallTotal = 0;       /* 标签页被挂起（切后台/锁屏）的次数 */
+    var winTicks = 0;         /* 背压结算窗口 */
+    var winMissed = 0;
+    var winClean = 0;
+
+    function computeHold() {
+        var h = Math.round(intervalMs() / vsyncMs);
+        if (h < 1) { h = 1; }
+        baseHold = h;
+        if (hold < baseHold) { hold = baseHold; }
+    }
+
+    /* 取样本的低分位而非最小值：最小值可能是一次异常短的回调 */
+    function measureVsync(dt) {
+        if (vsLocked || dt <= 0 || dt > 100) { return; }
+        vsSamples.push(dt);
+        if (vsSamples.length < 20) { return; }
+        vsSamples.sort(function (a, b) { return a - b; });
+        vsyncMs = vsSamples[Math.floor(vsSamples.length * 0.25)];
+        vsLocked = true;
+        computeHold();
+    }
+
+    /* 锁定后持续滚动复测：首批样本可能被启动抖动污染，
+       窗口拖到另一块不同刷新率的显示器时也要跟着变。偏差超过 15% 才接受，
+       避免正常抖动导致 hold 反复横跳。 */
+    function remeasureVsync(dt) {
+        if (dt <= 0 || dt > 100) { return; }
+        reSamples.push(dt);
+        if (reSamples.length < 240) { return; }
+        var s = reSamples.slice(0).sort(function (a, b) { return a - b; });
+        var v = s[Math.floor(s.length * 0.25)];
+        reSamples = [];
+        if (Math.abs(v - vsyncMs) / vsyncMs > 0.15) {
+            vsyncMs = v;
+            computeHold();
+            hold = baseHold;  /* 清掉旧刷新率下累积的背压 */
+            winTicks = 0;
+            winMissed = 0;
+            winClean = 0;
+        }
+    }
+
+    /* 掉帧说明设备产不出这个帧率。此时降速，而不是继续输出被合成器丢掉的半帧。 */
+    function backoff(dt) {
+        /* 切到后台时 rAF 整个停摆，回到前台的第一个 dt 可能是几秒。
+           那是标签页挂起，不是渲染跟不上，不能据此降速。 */
+        if (dt > vsyncMs * 8) { stallTotal++; reSamples = []; return; }
+        remeasureVsync(dt);
+        var lost = Math.round(dt / vsyncMs) - 1;
+        if (lost > 0) { missedTotal += lost; winMissed += lost; }
+        winTicks++;
+        if (winTicks < 120) { return; }
+        if (winMissed > 9 && $("autoslow").checked) {
+            hold++;
+            winClean = 0;
+        } else if (winMissed === 0) {
+            winClean++;
+            if (winClean >= 2 && hold > baseHold) { hold--; winClean = 0; }
+        }
+        winTicks = 0;
+        winMissed = 0;
+    }
+
+    /* ------------------------------------------------ 播放循环 */
+
+    var rafId = null;
+    var statTick = 0;
+
+    function frameLoop(ts) {
+        if (!playing) { return; }
+        rafId = raf(frameLoop);
+        var t0 = nowFn();
+
+        commitPending();
+
+        if (lastTs) {
+            var dt = ts - lastTs;
+            if (!vsLocked) { measureVsync(dt); } else { backoff(dt); }
+        }
+        lastTs = ts;
+
+        vsyncCount++;
+        if (vsyncCount >= hold) {
+            if (present()) {
+                vsyncCount = 0;
+            } else {
+                /* 缓冲空：保持当前帧继续显示。多显示几个周期的完整帧仍可读，
+                   强行换上没准备好的内容才会产生废帧。 */
+                starveTotal++;
+            }
+        }
+
+        /* 本次回调的剩余预算内预渲染。超预算就不做，宁可缓冲变浅也不拖掉这一帧。 */
+        if (ringCount() < RING_SIZE - 1 && (nowFn() - t0) < vsyncMs * 0.4) {
+            try {
+                fillOne();
+            } catch (e) {
+                stop();
+                errEl.innerHTML = "编码出错: " + e.message;
+                return;
+            }
+        }
+
+        /* 统计刷新会触发布局，不能每帧做 */
+        statTick++;
+        if (statTick >= 30) {
+            statTick = 0;
+            refreshStats();
+            refreshHealth();
+        }
+    }
+
+    /* 无 rAF 的老浏览器降级路径：仍复用环形缓冲，把逐格绘制移出关键路径，
+       但无法与刷新同步，高帧率下的撕裂无解，故在 refreshHealth 里明示。 */
+    function tickLegacy() {
         if (!playing) { return; }
         var t0 = new Date().getTime();
+        commitPending();
         try {
-            drawFrame();
+            if (ringCount() === 0) { fillOne(); }
+            if (!present()) { starveTotal++; }
+            if (ringCount() < RING_SIZE - 1) { fillOne(); }
         } catch (e) {
             stop();
             errEl.innerHTML = "编码出错: " + e.message;
             return;
         }
-        refreshStats();
-        if (framesShown % 20 === 0) { saveState(); }
-        var interval = parseInt($("interval").value, 10) || 150;
-        var cost = new Date().getTime() - t0;
-        var wait = interval - cost;
+        statTick++;
+        if (statTick >= 10) { statTick = 0; refreshStats(); refreshHealth(); }
+        var wait = intervalMs() - (new Date().getTime() - t0);
         if (wait < 0) { wait = 0; }
-        timer = window.setTimeout(tick, wait);
+        timer = window.setTimeout(tickLegacy, wait);
     }
 
     function play() {
@@ -212,14 +477,26 @@ button { cursor: pointer; margin-right: 6px; }
         playing = true;
         $("btn_play").innerHTML = "暂停";
         $("qrwrap").style.display = "";
-        tick();
+        layout();
+        prefill(6);
+        vsyncCount = hold;    /* 首帧立即上屏 */
+        lastTs = 0;
+        pending = null;
+        if (raf) { rafId = raf(frameLoop); } else { tickLegacy(); }
     }
 
     function stop() {
         playing = false;
         $("btn_play").innerHTML = "开始播放";
+        if (rafId && caf) { caf(rafId); }
+        rafId = null;
         if (timer) { window.clearTimeout(timer); timer = null; }
+        /* 未确认上屏的帧不计入游标：宁可重发一帧，也不跳过一帧 */
+        pending = null;
+        ringReset();
         saveState();
+        refreshStats();
+        refreshHealth();
     }
 
     /* ------------------------------------------------ 帧转储导出（契约 14） */
@@ -284,8 +561,13 @@ button { cursor: pointer; margin-right: 6px; }
             tierIdx = Math.floor((tiers.length - 1) / 2);
             nextBlockId = 0;
             framesShown = 0;
+            missedTotal = 0;
+            starveTotal = 0;
+            stallTotal = 0;
             loadState();          /* 同一文件同参数重传时续接游标 */
             fillTierSelect();
+            computeHold();
+            layout();
             $("i_file").innerHTML = sess.fileName;
             $("i_size").innerHTML = fmtSize(sess.contentLen) +
                 "（流层 " + fmtSize(sess.stream.length) + "）";
@@ -295,6 +577,7 @@ button { cursor: pointer; margin-right: 6px; }
             $("i_K").innerHTML = sess.K;
             $("sesspanel").style.display = "";
             refreshStats();
+            refreshHealth();
         };
         reader.onerror = function () { errEl.innerHTML = "文件读取失败"; };
         reader.readAsArrayBuffer(f);
@@ -307,6 +590,7 @@ button { cursor: pointer; margin-right: 6px; }
     $("btn_reset").addEventListener("click", function () {
         nextBlockId = 0;
         framesShown = 0;
+        ringReset();
         saveState();
         refreshStats();
     });
@@ -314,15 +598,37 @@ button { cursor: pointer; margin-right: 6px; }
     $("btn_dump").addEventListener("click", exportDump);
 
     $("tier").addEventListener("change", function () {
-        /* 换档只改 m：T/K/codec/sessionId 不变，游标继续推进（契约 9） */
+        /* 换档只改 m：T/K/codec/sessionId 不变，游标继续推进（契约 9）。
+           已预渲染的帧按旧档编码，必须整体丢弃，layout 内的 ringReset 负责回退填充游标。 */
         tierIdx = this.selectedIndex;
+        if (sess) { layout(); prefill(playing ? 4 : 0); }
         saveState();
         refreshStats();
+        refreshHealth();
     });
 
     $("interval").addEventListener("change", function () {
+        computeHold();
+        hold = baseHold;      /* 手动改间隔时清掉背压累积的降速 */
         saveState();
         refreshStats();
+        refreshHealth();
+    });
+
+    $("fastmask").addEventListener("change", function () {
+        if (sess) { ringReset(); prefill(playing ? 4 : 0); }
+    });
+
+    /* 缩放会改变模块像素，必须重建缓冲；防抖避免拖动过程中反复重建 */
+    var resizeTimer = null;
+    window.addEventListener("resize", function () {
+        if (!sess) { return; }
+        if (resizeTimer) { window.clearTimeout(resizeTimer); }
+        resizeTimer = window.setTimeout(function () {
+            resizeTimer = null;
+            layout();
+            prefill(playing ? 4 : 0);
+        }, 200);
     });
 })();
 </script>
