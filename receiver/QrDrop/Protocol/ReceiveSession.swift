@@ -8,8 +8,9 @@
 
 import Foundation
 
-/// 会话统计，同时用于 11.1 识别率标定
-struct SessionStats {
+/// 会话统计，同时用于 11.1 识别率标定。
+/// 需可比较且可跨隔离域传递：它是界面快照的一部分
+struct SessionStats: Sendable, Equatable {
     var framesAccepted: Int = 0      // 通过 CRC32 的帧数
     var framesRejected: Int = 0      // 校验失败的帧数
     var blocksReceived: Int = 0      // 收到的编码块总数（含重复）
@@ -52,12 +53,16 @@ final class ReceiveSession: Identifiable {
     var savedFileURL: URL?
     var failureMessage: String?
     /// 正在后台还原（拼接 / 解压 / 校验 / 落盘）。期间不得再喂新块，
-    /// 否则后台读取解码器状态的同时主线程在改它。
+    /// 也不得有任何一路去碰这个会话的解码器——它此刻归后台任务独占。
     var isFinalizing: Bool = false
-    /// 还原进度 0…1，仅解方程的回代会真正推进
-    var finalizeProgress: Double = 0
+    /// 还原进度 0…1，仅解方程的回代会真正推进。
+    /// 由后台任务写、解码 actor 读，故用带锁的盒子而非裸 Double
+    var finalizeProgressBox: ProgressBox?
     /// 用户请求中止合并。后台线程轮询，故用带锁的标志而非裸 Bool
     var finalizeCancel: CancellationFlag?
+
+    /// 还原进度读数，未在还原时恒为 0
+    var finalizeProgress: Double { finalizeProgressBox?.value ?? 0 }
     /// 最终文件字节数。解码状态释放后由它提供展示数据
     var finalSize: Int?
 

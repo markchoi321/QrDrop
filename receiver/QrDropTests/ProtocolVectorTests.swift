@@ -27,6 +27,47 @@ import Foundation
 /// 仅用于定位测试 bundle
 final class VectorBundleAnchor {}
 
+/// 进度目录 Documents/progress 是全局共享的，而 ClearAllTests 会把它整个清空。
+/// swift-testing 默认并行跑用例，碰盘的用例必须串行化，否则会互相删文件。
+///
+/// 必须是异步互斥而不是 NSLock：临界区里要 await 解码 actor，
+/// 而 await 前后可能换线程，NSLock 在另一个线程上解锁是未定义行为。
+/// actor 本身也不够——它在 await 点会放行其它调用，正好破坏互斥，
+/// 因此自己维护 busy 标志与等待队列。
+actor ProgressDiskLock {
+
+    private static let shared = ProgressDiskLock()
+
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquire() async {
+        guard busy else { busy = true; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            busy = false
+        } else {
+            // 直接把所有权交给下一位，不落回 busy = false，避免插队
+            waiters.removeFirst().resume()
+        }
+    }
+
+    static func withLock<R>(_ body: () async throws -> R) async rethrows -> R {
+        await shared.acquire()
+        do {
+            let result = try await body()
+            await shared.release()
+            return result
+        } catch {
+            await shared.release()
+            throw error
+        }
+    }
+}
+
 /// 把实测 ε 等关键数字写到宿主机 /private/tmp，便于抓取（Xcode 控制台同时可见）
 enum TestReport {
     static let path = "/private/tmp/qrdrop-tests.log"
@@ -484,34 +525,188 @@ struct ProgressStoreTests {
     @Test func linearSolveProgressRoundTrip() throws { try roundTrip(codec: .linearSolve) }
     @Test func peelingProgressRoundTrip() throws { try roundTrip(codec: .peeling) }
 
-    @Test func diskRoundTripAndCleanup() throws {
-        let e2e = try Vectors.keyValues("e2e.txt")
-        let T = Int(e2e["lt.T"]!)!
-        let K = Int(e2e["lt.K"]!)!
-        let m = Int(e2e["lt.m"]!)!
-        let sid = UInt32(e2e["lt.sessionId"]!, radix: 16)!
-        let stream = try Vectors.binary("stream.bin")
-        let src = TestEncoder.splitSourceBlocks(stream, K: K, T: T)
-        let composer = PeelingComposer(K: K)
+    @Test func diskRoundTripAndCleanup() async throws {
+        try await ProgressDiskLock.withLock {
+            let e2e = try Vectors.keyValues("e2e.txt")
+            let T = Int(e2e["lt.T"]!)!
+            let K = Int(e2e["lt.K"]!)!
+            let m = Int(e2e["lt.m"]!)!
+            let sid = UInt32(e2e["lt.sessionId"]!, radix: 16)!
+            let stream = try Vectors.binary("stream.bin")
+            let src = TestEncoder.splitSourceBlocks(stream, K: K, T: T)
+            let composer = PeelingComposer(K: K)
 
-        let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
-        let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .peeling, compressed: false,
-                                            sessionId: sid, baseBlockId: 0, m: m, composer: composer)
-        _ = session.ingest(try #require(FrameParser.parse(bytes)))
+            let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
+            let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .peeling, compressed: false,
+                                                sessionId: sid, baseBlockId: 0, m: m, composer: composer)
+            _ = session.ingest(try #require(FrameParser.parse(bytes)))
 
-        try ProgressStore.save(session)
-        let url = ProgressStore.fileURL(for: sid)
-        #expect(FileManager.default.fileExists(atPath: url.path))
+            try ProgressStore.save(session)
+            let url = ProgressStore.fileURL(for: sid)
+            #expect(FileManager.default.fileExists(atPath: url.path))
 
-        let reloaded = try #require(try ProgressStore.decode(try Data(contentsOf: url)).first)
-        #expect(reloaded.decoder.solvedCount == session.decoder.solvedCount)
+            let reloaded = try #require(try ProgressStore.decode(try Data(contentsOf: url)).first)
+            #expect(reloaded.decoder.solvedCount == session.decoder.solvedCount)
 
-        ProgressStore.remove(sessionId: sid)
-        #expect(!FileManager.default.fileExists(atPath: url.path))
+            ProgressStore.remove(sessionId: sid)
+            #expect(!FileManager.default.fileExists(atPath: url.path))
+        }
     }
 
     @Test func rejectsBadMagic() {
         let bogus = Data([0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00])
         #expect(throws: ProgressStoreError.self) { try ProgressStore.decode(bogus) }
+    }
+
+    // MARK: - 增量日志
+
+    /// 分批喂帧，每批只把新产生的成果追加进日志；重放后必须与全量 checkpoint 完全等价。
+    /// 校验点是「续解到完成且 SHA-256 通过」——只有 pending 残值被逐字节重建对了才可能过。
+    private func journalRoundTrip(codec: Codec, sessionId sid: UInt32) async throws {
+        try await ProgressDiskLock.withLock { try journalRoundTripLocked(codec: codec, sessionId: sid) }
+    }
+
+    private func journalRoundTripLocked(codec: Codec, sessionId sid: UInt32) throws {
+        let e2e = try Vectors.keyValues("e2e.txt")
+        let name = codec == .linearSolve ? "rlnc" : "lt"
+        let T = Int(e2e["\(name).T"]!)!
+        let K = Int(e2e["\(name).K"]!)!
+        let m = Int(e2e["\(name).m"]!)!
+
+        let stream = try Vectors.binary("stream.bin")
+        let fixture = try Vectors.binary("fixture.bin")
+        let src = TestEncoder.splitSourceBlocks(stream, K: K, T: T)
+        let composer = TestEncoder.composer(for: codec, K: K)
+
+        ProgressStore.remove(sessionId: sid)
+        defer { ProgressStore.remove(sessionId: sid) }
+
+        let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: codec, compressed: false)
+        let journal = try ProgressJournal(session: session)
+        var base: UInt32 = 0
+        // 分批：每批 8 帧后刷一次日志，模拟真实的按时间刷盘
+        while session.stats.blocksUnique < K / 2 {
+            for _ in 0..<8 {
+                let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: codec, compressed: false,
+                                                    sessionId: sid, baseBlockId: base, m: m, composer: composer)
+                _ = session.ingest(try #require(FrameParser.parse(bytes)))
+                base = base &+ UInt32(m)
+            }
+            try journal.append(session.decoder.takeJournal(), stats: session.stats)
+        }
+        journal.close()
+
+        let logData = try Data(contentsOf: ProgressStore.logURL(for: sid))
+        let checkpoint = ProgressStore.encode([session])
+
+        let replayed = ReceiveSession(sessionId: sid, K: K, T: T, codec: codec, compressed: false)
+        try ProgressStore.applyLog(logData, to: replayed)
+
+        #expect(replayed.decoder.solvedCount == session.decoder.solvedCount, "重放后解出数必须一致")
+        #expect(replayed.decoder.pendingCount == session.decoder.pendingCount, "重放后 pending 数必须一致")
+        #expect(replayed.stats.blocksUnique == session.stats.blocksUnique)
+        // seen 必须一并恢复，否则重复块会被当成新块，进度虚高
+        #expect(!replayed.decoder.add(blockId: 0, payload: [UInt8](repeating: 0, count: T)),
+                "已收过的 blockId 必须仍被去重挡掉")
+
+        while !replayed.isComplete {
+            let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: codec, compressed: false,
+                                                sessionId: sid, baseBlockId: base, m: m, composer: composer)
+            _ = replayed.ingest(try #require(FrameParser.parse(bytes)))
+            base = base &+ UInt32(m)
+        }
+        #expect(try replayed.finalizeContent().content == fixture)
+
+        TestReport.log("\(codec.displayName) 增量日志：\(logData.count) 字节 vs checkpoint \(checkpoint.count) 字节，"
+                       + "解出 \(session.decoder.solvedCount)/\(K)，续解完成")
+    }
+
+    @Test func linearSolveJournalRoundTrip() async throws {
+        try await journalRoundTrip(codec: .linearSolve, sessionId: 0xA1B2_C301)
+    }
+
+    @Test func peelingJournalRoundTrip() async throws {
+        try await journalRoundTrip(codec: .peeling, sessionId: 0xA1B2_C302)
+    }
+
+    /// 崩溃会在日志末尾留下半条记录，重放必须丢弃残片而不是整份作废
+    @Test func truncatedJournalTailIsTolerated() async throws {
+        try await ProgressDiskLock.withLock {
+            let e2e = try Vectors.keyValues("e2e.txt")
+            let T = Int(e2e["lt.T"]!)!, K = Int(e2e["lt.K"]!)!, m = Int(e2e["lt.m"]!)!
+            let sid: UInt32 = 0xA1B2_C303
+            let src = TestEncoder.splitSourceBlocks(try Vectors.binary("stream.bin"), K: K, T: T)
+            let composer = PeelingComposer(K: K)
+
+            ProgressStore.remove(sessionId: sid)
+            defer { ProgressStore.remove(sessionId: sid) }
+
+            let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
+            let journal = try ProgressJournal(session: session)
+            var base: UInt32 = 0
+            for _ in 0..<16 {
+                let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .peeling, compressed: false,
+                                                    sessionId: sid, baseBlockId: base, m: m, composer: composer)
+                _ = session.ingest(try #require(FrameParser.parse(bytes)))
+                base = base &+ UInt32(m)
+            }
+            try journal.append(session.decoder.takeJournal(), stats: session.stats)
+            journal.close()
+
+            let full = try Data(contentsOf: ProgressStore.logURL(for: sid))
+            // 砍掉半条记录：尾部统计记录 41 字节，再多砍 10 字节保证落在一条记录中间
+            let cut = full.prefix(full.count - 51)
+            let replayed = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
+            try ProgressStore.applyLog(Data(cut), to: replayed)
+
+            #expect(replayed.decoder.solvedCount > 0 || replayed.decoder.pendingCount > 0,
+                    "残片之前的记录必须照常恢复")
+            #expect(replayed.decoder.solvedCount <= session.decoder.solvedCount)
+            TestReport.log("日志截断容忍：完整 \(full.count) 字节，截断到 \(cut.count) 字节仍恢复出 "
+                           + "\(replayed.decoder.solvedCount) 源块 / \(replayed.decoder.pendingCount) pending")
+        }
+    }
+
+    /// 写放大：增量日志的累计写入只与「产出的成果总量」成正比，与刷盘次数无关；
+    /// 而全量重写正比于刷盘次数 × 当时的状态大小。前者是本次改造的核心不变量。
+    @Test func journalWriteAmplificationIsBounded() async throws {
+        try await ProgressDiskLock.withLock {
+            let e2e = try Vectors.keyValues("e2e.txt")
+            let T = Int(e2e["lt.T"]!)!, K = Int(e2e["lt.K"]!)!, m = Int(e2e["lt.m"]!)!
+            let sid: UInt32 = 0xA1B2_C304
+            let src = TestEncoder.splitSourceBlocks(try Vectors.binary("stream.bin"), K: K, T: T)
+            let composer = PeelingComposer(K: K)
+
+            ProgressStore.remove(sessionId: sid)
+            defer { ProgressStore.remove(sessionId: sid) }
+
+            let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
+            let journal = try ProgressJournal(session: session)
+            var base: UInt32 = 0
+            var fullRewriteBytes = 0
+            var flushes = 0
+            // 按帧刷盘，与真实节奏一致
+            while !session.isComplete {
+                let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .peeling, compressed: false,
+                                                    sessionId: sid, baseBlockId: base, m: m, composer: composer)
+                _ = session.ingest(try #require(FrameParser.parse(bytes)))
+                base = base &+ UInt32(m)
+                try journal.append(session.decoder.takeJournal(), stats: session.stats)
+                // 同一节奏下旧策略每次都要全量重写
+                fullRewriteBytes += session.decoder.snapshotByteEstimate
+                flushes += 1
+            }
+            journal.close()
+            let logBytes = try Data(contentsOf: ProgressStore.logURL(for: sid)).count
+            let finalBytes = ProgressStore.encode([session]).count
+
+            // 每份成果只写一次：源块一次，进过 pending 的原始块一次，合计约 2 倍终态
+            #expect(logBytes < finalBytes * 3, "累计写入必须被钳在终态的常数倍内，与刷盘次数无关")
+            TestReport.log(String(format: "写放大（K=%d T=%d，%d 次刷盘）：增量累计 %d 字节 = 终态 %d 的 %.2f 倍；"
+                                  + "同节奏全量重写 %d 字节，降为 %.1f%%",
+                                  K, T, flushes, logBytes, finalBytes,
+                                  Double(logBytes) / Double(finalBytes),
+                                  fullRewriteBytes, Double(logBytes) / Double(fullRewriteBytes) * 100))
+        }
     }
 }

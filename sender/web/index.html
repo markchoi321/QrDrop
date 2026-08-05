@@ -57,7 +57,7 @@ button { cursor: pointer; margin-right: 6px; }
         <label for="tier">档位</label>
         <select id="tier"></select>
         <label for="interval">间隔(ms)</label>
-        <input type="number" id="interval" value="150" min="8" step="1" style="width:70px">
+        <input type="number" id="interval" value="50" min="8" step="1" style="width:70px">
         <label><input type="checkbox" id="fastmask">快速掩码(高帧率自动启用)</label>
         <label><input type="checkbox" id="autoslow" checked>掉帧自动降速</label>
     </div>
@@ -130,7 +130,7 @@ button { cursor: pointer; margin-right: 6px; }
                 nextBlockId: nextBlockId,
                 framesShown: framesShown,
                 tier: tierIdx,
-                intervalMs: parseInt($("interval").value, 10) || 150
+                intervalMs: parseInt($("interval").value, 10) || 50
             }));
         } catch (e) { /* 同上 */ }
     }
@@ -145,7 +145,7 @@ button { cursor: pointer; margin-right: 6px; }
 
     function intervalMs() {
         var v = parseInt($("interval").value, 10);
-        return v >= 8 ? v : 150;
+        return v >= 8 ? v : 50;
     }
 
     function currentPassFrames() {
@@ -558,7 +558,7 @@ button { cursor: pointer; margin-right: 6px; }
                 return;
             }
             tiers = sess.tiers;
-            tierIdx = Math.floor((tiers.length - 1) / 2);
+            tierIdx = tiers.length - 1;   /* 默认最高档位 */
             nextBlockId = 0;
             framesShown = 0;
             missedTotal = 0;

@@ -25,6 +25,25 @@ final class CancellationFlag: @unchecked Sendable {
     }
 }
 
+/// 后台合并任务向外上报 0…1 进度的通道。
+/// 合并跑在 detached task 上，而会话对象归解码 actor 独占，两边不能直接读写同一个字段。
+final class ProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var progress: Double = 0
+
+    var value: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return progress
+    }
+
+    func set(_ v: Double) {
+        lock.lock()
+        progress = v
+        lock.unlock()
+    }
+}
+
 enum Diagnostics {
 
     /// 当前进程常驻内存（MB）。接收端会在内存里堆着编码块与源块，

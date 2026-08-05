@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import QuartzCore
 @testable import QrDrop
 
 @MainActor
@@ -51,8 +52,8 @@ struct FinalizeLifecycleTests {
         #expect(session.decoder.solvedCount == K)
         #expect(session.decoder.pendingCount == 0)
         // 中间态必须真的没了
-        #expect(session.decoder.snapshotSolved().isEmpty)
-        #expect(session.decoder.snapshotPending().isEmpty)
+        #expect(session.decoder.snapshotRecords().isEmpty)
+        #expect(session.decoder.snapshotByteEstimate == 0)
         if let peeling = session.decoder as? PeelingDecoder {
             #expect(peeling.solvedBlock(0) == nil, "释放后读源块不得越界")
         }
@@ -106,7 +107,11 @@ struct FinalizeLifecycleTests {
 struct ManualFinalizeTests {
 
     /// 收齐后不得自动合并：合并耗时不可预测，必须由用户触发
-    @Test func completionDoesNotAutoMerge() throws {
+    @Test func completionDoesNotAutoMerge() async throws {
+        try await ProgressDiskLock.withLock { try await completionDoesNotAutoMergeLocked() }
+    }
+
+    private func completionDoesNotAutoMergeLocked() async throws {
         let vectors = try Vectors.binary("stream.bin")
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
@@ -114,22 +119,26 @@ struct ManualFinalizeTests {
         let src = TestEncoder.splitSourceBlocks(vectors, K: K, T: T)
         let composer = LinearSolveComposer(K: K)
 
-        let receiver = FileReceiver()
-        receiver.clearAll()
+        let engine = DecodeEngine()
+        await engine.clearAll()
+        // 本用例会把会话喂到收齐并落盘。不清场的话，留下的「已完成」进度文件
+        // 会被后续用例的 restoreProgress 读回来，投喂新帧直接走 isComplete 提前返回
+        defer { Task { await engine.clearAll() } }
+
         var base: UInt32 = 0
         let m = 40
-        while receiver.sessions[sid]?.isComplete != true && base < UInt32(K * 4) {
+        while await engine.sessionSnapshot(sid)?.isComplete != true && base < UInt32(K * 4) {
             let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .linearSolve,
                                                 compressed: false, sessionId: sid,
                                                 baseBlockId: base, m: m, composer: composer)
-            _ = receiver.processPayload(Data(bytes))
+            await engine.processPayload(Data(bytes))
             base &+= UInt32(m)
         }
-        let session = try #require(receiver.sessions[sid])
+        let session = try #require(await engine.sessionSnapshot(sid))
         #expect(session.isComplete, "块应已收齐")
         #expect(!session.isFinalizing, "不得自动开始合并")
         #expect(!session.isFinished, "不得自动落盘")
-        #expect(!session.decoder.isReleased, "未合并前中间态必须保留")
+        #expect(!(await engine.decoderReleased(sid)), "未合并前中间态必须保留")
     }
 
     /// 收齐但未合并的会话必须能被保存，否则退出即丢
@@ -148,7 +157,11 @@ struct ManualFinalizeTests {
         }
         #expect(session.isComplete && !session.isFinished)
         // 快照必须仍然拿得到全部源块
-        #expect(session.decoder.snapshotSolved().count == K)
+        let solvedRecords = session.decoder.snapshotRecords().filter {
+            if case .solved = $0 { return true }
+            return false
+        }
+        #expect(solvedRecords.count == K)
         let blob = ProgressStore.encode([session])
         #expect(blob.count > K * T, "序列化必须包含全部源块")
     }
@@ -156,7 +169,6 @@ struct ManualFinalizeTests {
 
 // MARK: - 清理
 
-@MainActor
 struct ClearAllTests {
 
     private var receivedDir: URL {
@@ -164,8 +176,10 @@ struct ClearAllTests {
             .appendingPathComponent("received", isDirectory: true)
     }
 
-    /// 造一个进行中的会话，同时留下进度文件
-    private func seedSession(_ receiver: FileReceiver) throws -> UInt32 {
+    /// 造一个进行中的会话，同时留下进度文件。
+    /// 一并返回投喂时刻：速率是 1 秒滑动窗口，读数必须锚定在投喂那一刻，
+    /// 否则随后的写盘一慢，样本就滑出窗口，断言变成看机器负载的运气
+    private func seedSession(_ engine: DecodeEngine) async throws -> (sid: UInt32, fedAt: CFTimeInterval) {
         let stream = try Vectors.binary("stream.bin")
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
@@ -175,58 +189,67 @@ struct ClearAllTests {
                                             compressed: false, sessionId: sid,
                                             baseBlockId: 0, m: 8,
                                             composer: LinearSolveComposer(K: K))
-        _ = receiver.processPayload(Data(bytes))
-        try ProgressStore.save(#require(receiver.sessions[sid]))
-        return sid
+        await engine.clearAll()
+        await engine.processPayload(Data(bytes))
+        let fedAt = CACurrentMediaTime()
+        await engine.saveAllProgress(force: true)
+        return (sid, fedAt)
     }
 
     /// 清理必须真的清掉会话列表。
     /// 早前按钮接的是只删磁盘进度文件的入口，内存里的 sessions 一个没动，
-    /// 界面看不出任何变化，而且 5 秒后的自动保存会把进度文件原样写回。
-    @Test func clearAllEmptiesSessionList() throws {
-        let receiver = FileReceiver()
-        let sid = try seedSession(receiver)
-        #expect(receiver.sessions[sid] != nil)
-        #expect(!receiver.sortedSessions.isEmpty)
+    /// 界面看不出任何变化，而且下一次刷盘会把进度文件原样写回。
+    @Test func clearAllEmptiesSessionList() async throws {
+        try await ProgressDiskLock.withLock {
+            let engine = DecodeEngine()
+            let sid = try await seedSession(engine).sid
+            #expect(await engine.sessionSnapshot(sid) != nil)
+            #expect(await engine.sessionCount == 1)
 
-        receiver.clearAll()
+            await engine.clearAll()
 
-        #expect(receiver.sessions.isEmpty, "会话列表必须被清空")
-        #expect(receiver.sortedSessions.isEmpty)
-        #expect(receiver.legacyFiles.isEmpty)
+            #expect(await engine.isEmpty, "会话列表必须被清空")
+            #expect(await engine.sessionCount == 0)
+        }
     }
 
-    /// 清理后重启不得把会话恢复回来：磁盘进度文件也必须一并删除
-    @Test func clearAllRemovesProgressFiles() throws {
-        let receiver = FileReceiver()
-        _ = try seedSession(receiver)
-        receiver.clearAll()
+    /// 清理后重启不得把会话恢复回来：磁盘进度文件与增量日志都必须一并删除
+    @Test func clearAllRemovesProgressFiles() async throws {
+        try await ProgressDiskLock.withLock {
+            let engine = DecodeEngine()
+            _ = try await seedSession(engine)
+            await engine.clearAll()
 
-        // 新实例走 restoreProgress，若进度文件还在就会把会话读回来
-        let reopened = FileReceiver()
-        #expect(reopened.sessions.isEmpty, "清理后重启不得恢复出会话")
+            // 新实例走 restoreProgress，若进度文件还在就会把会话读回来
+            let reopened = DecodeEngine()
+            await reopened.restoreProgress()
+            #expect(await reopened.isEmpty, "清理后重启不得恢复出会话")
+        }
     }
 
     /// 已落盘的最终文件也要删：会话记录没了之后，app 内再没有入口能访问到它们
-    @Test func clearAllRemovesReceivedFiles() throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: receivedDir, withIntermediateDirectories: true)
-        let marker = receivedDir.appendingPathComponent("clear-test.bin")
-        try Data([1, 2, 3]).write(to: marker)
-        #expect(fm.fileExists(atPath: marker.path))
+    @Test func clearAllRemovesReceivedFiles() async throws {
+        try await ProgressDiskLock.withLock {
+            let fm = FileManager.default
+            try fm.createDirectory(at: receivedDir, withIntermediateDirectories: true)
+            let marker = receivedDir.appendingPathComponent("clear-test.bin")
+            try Data([1, 2, 3]).write(to: marker)
+            #expect(fm.fileExists(atPath: marker.path))
 
-        let receiver = FileReceiver()
-        receiver.clearAll()
+            await DecodeEngine().clearAll()
 
-        #expect(!fm.fileExists(atPath: marker.path), "已接收文件必须一并删除")
+            #expect(!fm.fileExists(atPath: marker.path), "已接收文件必须一并删除")
+        }
     }
 
     /// 速率读数也要清零，否则清空后界面还挂着上次的速率
-    @Test func clearAllResetsThroughput() throws {
-        let receiver = FileReceiver()
-        _ = try seedSession(receiver)
-        #expect(receiver.throughput.bytesPerSecond() > 0)
-        receiver.clearAll()
-        #expect(receiver.throughput.bytesPerSecond() == 0)
+    @Test func clearAllResetsThroughput() async throws {
+        try await ProgressDiskLock.withLock {
+            let engine = DecodeEngine()
+            let seeded = try await seedSession(engine)
+            #expect(engine.throughput.bytesPerSecond(now: seeded.fedAt) > 0)
+            await engine.clearAll()
+            #expect(engine.throughput.bytesPerSecond() == 0)
+        }
     }
 }

@@ -309,14 +309,65 @@ need = max(512, 20 + T)
 
 ---
 
-## 11. 进度持久化格式（设计 9.2）
+## 11. 进度持久化格式（设计 9.2，格式版本 2）
 
-文件名 `Documents/progress/<sessionId 8位小写hex>.vdpg`，每会话一个文件。全部大端。
+每会话两个文件，全部大端：
+
+- `Documents/progress/<sessionId 8位小写hex>.vdpg` —— checkpoint（压实后的全量快照）
+- 同名 `.vdlog` —— 增量日志（热路径只往这里追加）
+
+### 11.1 为什么是增量日志
+
+v1 每 5 秒把整个解码状态全量重写一遍，单次写入正比于已有进度，全会话累计写入是
+O(文件大小² / 保存间隔)。而两个解码器的成果侧本来就是**写一次后永不回改**的：
+
+- 解方程：`add` 把新块沿已有基行下行消元，最终只落进**一个空的 pivot 槽**，
+  已存在的基行从不被修改；回代 `assemble` 也是 out-of-place。
+- 剥洋葱：`solved[i]` 一旦写入终身不变；唯一可变的是 pending 池。
+
+因此热路径只追加新产生的成果，日志涨到超过状态本身时才压实成一份 checkpoint 并清空日志，
+**写放大钳在 2 倍以内**，累计写入降为 O(文件大小)。
+
+pending 池虽可变，但它的残值是 `(原始编码块, 已解出集合)` 的纯函数——异或折叠可交换、
+与顺序无关。所以日志里只记**未经任何消元的原始块**，随后无论降度多少次都不必回改这条记录；
+恢复时先装 solved 再重放原始块，`add` 对每个已解邻居恰好异或一次，**与当初增量降度的异或
+次数完全相同，没有多做一次**。解方程方案不能这么做：重放一个原始块要走 O(K/64) 位集异或
+加最多 K 次块异或，全部重放是 O(K²)，因此那边存的是消元后的基行——反正基行本身不可变。
+
+### 11.2 记录
+
+checkpoint 与日志共用同一套记录，checkpoint 就是日志压实后的形态。
+`T` 与 `K` 由所在文件的会话头给出。
+
+```
+tag  名称       载荷
+0x01 SEEN       blockId(4)                                   已收 blockId，用于去重与统计
+0x02 SEENMAP    base(4) bitCount(4) bits(⌈bitCount/8⌉)       SEEN 的压实形态，位 i 表示 base+i
+0x03 SOLVED     index(3) data(T)                             剥洋葱：已解出的源块
+0x04 RAWBLOCK   blockId(4) payload(T)                        剥洋葱：度≥2 进池的原始块
+0x05 PENDING    blockId(4) degree(2) neighbors(3×degree) payload(T)
+                                                             剥洋葱：pending 残值，仅 checkpoint
+0x06 BASIS      pivot(3) coeff(⌈K/8⌉) data(T)                解方程：一行消元基
+0x07 STATS      stats(40)                                    仅日志，恢复时以最后一条为准
+```
+
+日志只出现 SEEN / SOLVED / RAWBLOCK / BASIS / STATS；
+checkpoint 只出现 SEENMAP / SOLVED / PENDING / BASIS。
+
+`BASIS.coeff` 是**系数向量位图**，与 `BitSet.littleEndianBytes` 同序（位 i 在字节 i/8 的第
+i%8 位）。v1 按每个置位 3 字节的下标序列存，而化简后的基行平均有 K/2 个置位，
+即 1.5K 字节/行、全量 1.5K² 字节；位图是 K/8 字节/行，**小一个数量级**。
+
+`PENDING.neighbors` 可由 `blockId` 与 K 重算，存下来只作 PRNG 跨版本一致性自检：
+恢复时重算并比对，不一致则丢弃该记录并记日志。RAWBLOCK 不带此自检——它存的是原始块，
+邻居全部重算，PRNG 若变更会导致解码结果不同，由最终的 SHA-256 校验兜底。
+
+### 11.3 checkpoint 文件（同时是导出/导入格式）
 
 ```
 文件头
  0   4  magic          "VDPG"
- 4   2  formatVersion  1
+ 4   2  formatVersion  2
  6   2  sessionCount   uint16（单会话文件恒为 1，保留多会话打包能力）
 
 会话记录 × sessionCount
@@ -326,19 +377,32 @@ need = max(512, 20 + T)
  9   1  flags          bit0 compressed, bit1 有 meta, bit2 codec
 10   2  metaLen        uint16，无 meta 时为 0
 12   …  meta           StreamHeader 原样字节（54 + fileNameLen）
- …   4  solvedCount    uint32
- …   …  solvedBlocks   solvedCount × (3B 源块索引 + T 字节数据)
- …   4  pendingCount   uint32
- …   …  pendingBlocks  见下
  …  40  stats          见下
+ …   4  recordCount    uint32
+ …   …  records        见 11.2
+```
 
-pendingBlock 记录
- 0   4  blockId
- 4   2  degree         剩余邻居数 uint16
- 6   …  neighbors      degree × 3 字节索引（升序）
- …   T  payload        残值
+### 11.4 日志文件
 
-stats（40 字节）
+```
+ 0   4  magic          "VDLG"
+ 4   2  formatVersion  2
+ 6   4  sessionId
+10   3  K              uint24
+13   2  T              uint16
+15   1  flags          bit0 compressed, bit2 codec
+16   …  records        见 11.2，纯追加
+```
+
+日志头不带 meta：剥洋葱可在恢复后由已解源块重新解析出 StreamHeader，
+解方程本来就要到收齐才有 meta。
+
+崩溃可能在末尾留下半条记录。读日志时末尾残缺直接丢弃，不视为文件损坏；
+读 checkpoint 时任何截断都是损坏。
+
+### 11.5 stats（40 字节）
+
+```
  0   4  framesAccepted   uint32
  4   4  framesRejected   uint32
  8   4  blocksReceived   uint32
@@ -349,23 +413,23 @@ stats（40 字节）
 32   8  lastSeenAt       float64，Unix 时间戳秒
 ```
 
-**解方程会话的 pendingBlocks 语义不同**：存的是消元基（basis），`blockId` 字段写入该基行的
-pivot 索引，`neighbors` 写系数向量中置 1 的源块索引（升序），`payload` 写该基行的数据。
-恢复时直接重建 `basis[pivot] = (系数向量, 数据)`，不需要重新推导。
+### 11.6 策略
 
-`neighbors` 可由 `blockId` 与 K 重算，存下来是为省去恢复时的重算，并可作为 PRNG
-跨版本一致性的自检：恢复时重算并比对，不一致则丢弃该 pending 块并记日志。
-（解方程会话不做此自检，因为存的是消元后的基而非原始块。）
+- 刷日志：会话有新成果且距上次刷盘超过 1 秒；收齐时立即刷；App 进入后台立即刷
+- 压实：日志字节数超过 `max(512 KB, 当前状态估算字节数)` 时写 checkpoint 并删除日志。
+  顺序是先落 checkpoint 再删日志——中间崩溃只会留下一段过期日志，
+  重放时被 `seen` 去重挡掉，不会污染状态
+- 恢复：App 启动时扫描目录，先装 checkpoint，再把同 sessionId 的日志重放在其上；
+  只有日志没有 checkpoint 时，按日志头把会话建出来
+- 清理：会话完成并成功落盘文件后删除 `.vdpg` 与 `.vdlog`；提供手动清理入口
+- 导出/导入（跨设备迁移）用 checkpoint 格式，`sessionCount` 可 > 1
 
-策略：
-- 自动保存：会话新增源块且距上次保存超过 5 秒；App 进入后台时立即全量保存
-- 恢复：App 启动时扫描目录加载全部会话
-- 清理：会话完成并成功落盘文件后删除对应进度文件；提供手动清理入口
-- 导出/导入（跨设备迁移）复用同一格式，`sessionCount` 可 > 1
+`seen` 集合必须持久化。v1 只对 pending 记录恢复了 blockId，已解出块的 blockId 全部丢失，
+续传后这些块重复到达会被判为新块，`blocksUnique` 虚增、进度条偏高。
 
 ---
 
-## 11.5 接收端取字节：payloadData 不是帧字节
+## 11.7 接收端取字节：payloadData 不是帧字节
 
 **这是一个已经在现场造成「完全识别不了」的坑，实现时必须处理。**
 
@@ -414,7 +478,7 @@ n 字节数据
 - `CIQRCodeFeature.symbolDescriptor`（iOS 11 起）
 - `VNBarcodeObservation.barcodeDescriptor`
 
-都返回 `CIQRCodeDescriptor`，其 `errorCorrectedPayload` 就是 11.5 说的原始数据码字，
+都返回 `CIQRCodeDescriptor`，其 `errorCorrectedPayload` 就是 11.7 说的原始数据码字，
 按同一套逻辑取出字节模式段即可。实测 V15–V40 十档全部逐字节还原。
 
 工程含义：AVFoundation 的元数据输出在采集管线内完成检测，功耗远低于逐帧跑 Vision 推理，
@@ -436,7 +500,7 @@ n 字节数据
 | `fixture.bin` | 20000 字节原始文件 | 二进制 |
 | `stream.bin` | 上者的流层字节（未压缩） | 二进制 |
 | `frames_rlnc.txt` / `frames_lt.txt` | 整帧字节 | `<baseBlockId> <整帧hex>` |
-| `qr_codewords.txt` | QR 原始数据码字（见 11.5） | `<symbolVersion> <帧hex> <码字hex>` |
+| `qr_codewords.txt` | QR 原始数据码字（见 11.7） | `<symbolVersion> <帧hex> <码字hex>` |
 | `e2e.txt` | fixture 的 T/K/m/sessionId/sha256 | `<键> <值>` |
 
 `#` 开头的行是注释，需跳过。

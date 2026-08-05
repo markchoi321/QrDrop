@@ -91,9 +91,8 @@ struct PhotoImportView: View {
                    let uiImage = UIImage(data: data),
                    let cgImage = uiImage.cgImage {
                     
-                    let success = await MainActor.run {
-                        receiver.processImage(cgImage)
-                    }
+                    // 识别与解码都在后台，这里只等结果
+                    let success = await receiver.processImage(cgImage)
                     
                     await MainActor.run {
                         processedCount += 1

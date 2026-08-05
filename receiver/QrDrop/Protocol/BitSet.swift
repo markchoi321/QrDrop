@@ -30,6 +30,16 @@ struct BitSet {
         maskTail()
     }
 
+    /// littleEndianBytes 的逆过程，用于从进度文件重建系数向量
+    init(bitCount: Int, littleEndianBytes bytes: [UInt8]) {
+        self.init(bitCount: bitCount)
+        let n = min(bytes.count, (bitCount + 7) / 8)
+        for j in 0..<n {
+            words[j >> 3] |= UInt64(bytes[j]) << UInt64((j & 7) * 8)
+        }
+        maskTail()
+    }
+
     /// 清掉超出 bitCount 的高位
     private mutating func maskTail() {
         let rem = bitCount & 63

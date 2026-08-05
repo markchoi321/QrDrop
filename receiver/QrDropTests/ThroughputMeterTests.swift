@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import QuartzCore
 @testable import QrDrop
 
 @MainActor
@@ -89,7 +90,7 @@ struct ThroughputMeterTests {
 
     /// 速率必须只计去重后的新块：采样混叠模型要求每个二维码被扫到 2.5 次以上，
     /// 把重复帧算进去会让读数虚高一倍以上，无法用来比较档位与间隔
-    @Test func duplicateBlocksAreNotCounted() throws {
+    @Test func duplicateBlocksAreNotCounted() async throws {
         let stream = try Vectors.binary("stream.bin")
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
@@ -100,14 +101,21 @@ struct ThroughputMeterTests {
                                             compressed: false, sessionId: sid,
                                             baseBlockId: 0, m: m,
                                             composer: LinearSolveComposer(K: K))
-        let receiver = FileReceiver()
-        receiver.clearAll()
-        _ = receiver.processPayload(Data(bytes))
-        let after1 = receiver.throughput.bytesPerSecond()
-        // 同一帧重复投递，blockId 相同，应全部被去重，速率不再增长
-        for _ in 0..<4 { _ = receiver.processPayload(Data(bytes)) }
-        let after5 = receiver.throughput.bytesPerSecond()
-        #expect(after1 > 0)
-        #expect(after5 == after1, "重复帧不得计入速率")
+        // clearAll 会清空全局共享的进度目录，必须与其它碰盘用例串行
+        try await ProgressDiskLock.withLock {
+            let engine = DecodeEngine()
+            await engine.clearAll()
+            await engine.processPayload(Data(bytes))
+            // 读数锚定在投喂那一刻。取墙钟的话，后面几次投递一慢就跨过 1 秒窗口边界，
+            // 已记的样本被剔掉，断言变成看机器负载的运气。
+            // 窗口外的样本才会被剔除，晚于 fedAt 记入的样本仍会计入总量，
+            // 所以这个读数照样能验证「重复帧没被计进去」
+            let fedAt = CACurrentMediaTime()
+            // 同一帧重复投递，blockId 相同，应全部被去重，速率不再增长
+            for _ in 0..<4 { await engine.processPayload(Data(bytes)) }
+            let after5 = engine.throughput.bytesPerSecond(now: fedAt)
+            #expect(after5 > 0)
+            #expect(after5 == Double(m * T) / ThroughputMeter.window, "重复帧不得计入速率")
+        }
     }
 }

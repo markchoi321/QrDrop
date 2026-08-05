@@ -45,11 +45,7 @@ struct DocumentPickerView: UIViewControllerRepresentable {
             do {
                 let data = try Data(contentsOf: url)
                 Task { @MainActor in
-                    do {
-                        try receiver.loadProgress(from: data)
-                    } catch {
-                        receiver.addLog("加载进度失败: \(error.localizedDescription)", isError: true)
-                    }
+                    receiver.loadProgress(from: data)
                 }
             } catch {
                 Task { @MainActor in
