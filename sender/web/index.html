@@ -558,7 +558,12 @@ button { cursor: pointer; margin-right: 6px; }
                 return;
             }
             tiers = sess.tiers;
-            tierIdx = tiers.length - 1;   /* 默认最高档位 */
+            tierIdx = 0;                  /* 默认档位：单个二维码容量最接近 2KB 的档 */
+            var tierDiff = Infinity;
+            for (var ti = 0; ti < tiers.length; ti++) {
+                var d = Math.abs(tiers[ti].capacity - 2048);
+                if (d < tierDiff) { tierDiff = d; tierIdx = ti; }
+            }
             nextBlockId = 0;
             framesShown = 0;
             missedTotal = 0;
