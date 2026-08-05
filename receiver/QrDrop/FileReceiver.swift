@@ -86,10 +86,10 @@ final class FileReceiver: ObservableObject {
     @Published private(set) var legacyFiles: [LegacyFileSnapshot] = []
     @Published var logs: [LogEntry] = []
     @Published var selectedEngine: QREngine = .vision
-    /** 扫描最大帧率，5/10/15/20/25/30 六档，默认 20fps */
-    @Published var maxScanFps: Int = 20
-    /** 摄像头分辨率，默认 720p */
-    @Published var scanResolution: ScanResolution = .hd720p
+    /** 扫描最大帧率，5/10/15/20/25/30 六档，默认 30fps */
+    @Published var maxScanFps: Int = 30
+    /** 摄像头分辨率，默认 1080p */
+    @Published var scanResolution: ScanResolution = .hd1080p
 
     /// 解码与持久化的唯一所有者
     let engine = DecodeEngine()
