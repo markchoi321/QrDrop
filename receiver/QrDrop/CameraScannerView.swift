@@ -25,12 +25,12 @@ struct CameraScannerView: View {
     /// 速率需要在没有新帧时也归零，因此单独定时刷新，不能只靠 receiver 的变更驱动。
     ///
     /// 必须用 @State 持有：写成 let 属性时，View 结构体每次重建都会新建一个 publisher，
-    /// onReceive 随之退订重订、0.25 秒倒计时被反复重置。扫描时 revision 每帧都在变、
+    /// onReceive 随之退订重订、0.25 秒倒计时被反复重置。扫描时会话快照每 100ms 换一次、
     /// body 重建远快于 0.25 秒，结果是读数几乎不刷新。
     @State private var rateTimer = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     /// 仍在接收的会话，已完成的不在扫描界面显示进度
-    private var activeSessions: [ReceiveSession] {
+    private var activeSessions: [SessionSnapshot] {
         receiver.sortedSessions.filter { !$0.isComplete }
     }
 
@@ -56,7 +56,7 @@ struct CameraScannerView: View {
 
     /// 各会话已解出的源块合计。BP 解码前期几乎不动、末期雪崩式完成。
     private var totalBlocksSolved: Int {
-        activeSessions.reduce(0) { $0 + $1.decoder.solvedCount }
+        activeSessions.reduce(0) { $0 + $1.solvedCount }
     }
 
     var body: some View {
@@ -165,17 +165,10 @@ struct CameraScannerView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") {
-                        let started = Date()
                         scanner.stop()
                         dismiss()
-                        // 保存放到关闭之后，避免序列化挡住关闭动画
-                        Task { @MainActor in
-                            receiver.saveAllProgress(force: true)
-                            let ms = Diagnostics.elapsedMs(since: started)
-                            if ms > 300 {
-                                receiver.addLog("退出扫描耗时 \(ms) ms，\(Diagnostics.memoryTag())")
-                            }
-                        }
+                        // 刷盘在解码 actor 上跑，不挡关闭动画
+                        receiver.saveAllProgress(force: true)
                     }
                 }
             }
@@ -183,18 +176,10 @@ struct CameraScannerView: View {
                 scanner.engine = receiver.selectedEngine
                 scanner.maxFps = receiver.maxScanFps
                 scanner.resolution = receiver.scanResolution
+                // 识别结果直接投进解码 actor，不经主线程——喷泉码的雪崩剥离
+                // 在大文件上是几百毫秒级的，放主线程会把取景一起冻住
                 scanner.onQRCodeDetected = { [weak receiver] payloads in
-                    guard let receiver = receiver else { return }
-                    Task { @MainActor in
-                        for payload in payloads where receiver.processPayload(payload) {
-                            // 只反映仍在接收的会话；全部完成时清空，不再显示已完成文件的进度
-                            if let session = receiver.sortedSessions.last(where: { !$0.isComplete }) {
-                                lastReceivedInfo = "\(session.displayName)  \(session.stats.blocksUnique)/\(session.estimatedNeededBlocks) 块"
-                            } else {
-                                lastReceivedInfo = ""
-                            }
-                        }
-                    }
+                    receiver?.submit(payloads)
                 }
                 scanner.start()
             }
@@ -203,6 +188,12 @@ struct CameraScannerView: View {
                 Task { @MainActor in receiver.saveAllProgress(force: true) }
             }
             .onReceive(rateTimer) { _ in
+                // 只反映仍在接收的会话；全部完成时清空，不再显示已完成文件的进度
+                if let session = receiver.sortedSessions.last(where: { !$0.isComplete }) {
+                    lastReceivedInfo = "\(session.displayName)  \(session.stats.blocksUnique)/\(session.estimatedNeededBlocks) 块"
+                } else {
+                    lastReceivedInfo = ""
+                }
                 rate = receiver.throughput.bytesPerSecond()
                 detectedFps = scanner.detectedMeter.perSecond()
                 processedFps = scanner.processedMeter.perSecond()
@@ -213,7 +204,7 @@ struct CameraScannerView: View {
     // MARK: - 会话进度行（主进度用编码块，次要指标用源块）
 
     @ViewBuilder
-    private func sessionRow(_ session: ReceiveSession) -> some View {
+    private func sessionRow(_ session: SessionSnapshot) -> some View {
         VStack(spacing: 4) {
             HStack {
                 Text(session.displayName)
@@ -229,7 +220,7 @@ struct CameraScannerView: View {
                 .tint(session.isComplete ? .green : .green.opacity(0.8))
 
             HStack {
-                Text("源块 \(session.decoder.solvedCount)/\(session.K)")
+                Text("源块 \(session.solvedCount)/\(session.K)")
                 Spacer()
                 Text("\(session.codec.displayName) · T=\(session.T)")
             }
@@ -240,18 +231,18 @@ struct CameraScannerView: View {
     }
 
     @ViewBuilder
-    private func legacyRow(_ file: LegacyFile) -> some View {
+    private func legacyRow(_ file: LegacyFileSnapshot) -> some View {
         VStack(spacing: 4) {
             HStack {
                 Text("[旧] \(file.fileName)")
                     .font(.caption)
                     .lineLimit(1)
                 Spacer()
-                Text("\(file.chunks.count)/\(file.totalChunks)")
+                Text("\(file.receivedChunks)/\(file.totalChunks)")
                     .font(.caption.bold().monospacedDigit())
             }
             .foregroundStyle(.white)
-            ProgressView(value: Double(file.chunks.count), total: Double(max(1, file.totalChunks)))
+            ProgressView(value: Double(file.receivedChunks), total: Double(max(1, file.totalChunks)))
                 .tint(.blue)
         }
         .padding(.horizontal)
@@ -282,7 +273,9 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
     private let metadataOutput = AVCaptureMetadataOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
-    private let visionQueue = DispatchQueue(label: "vision.processing.queue", qos: .userInitiated)
+    /// 识别处理队列。Vision 推理与 AVFoundation 元数据回调都走它——两个引擎在
+    /// configureSession 里二选一，不会并发，因此 deliver 与其去重表仍是单线程访问
+    private let visionQueue = DispatchQueue(label: "qr.detect.queue", qos: .userInitiated)
     private var isRunning = false
     private var isProcessingVisionFrame = false
     /// 已交付过的载荷哈希，避免同一帧被反复解析
@@ -343,7 +336,7 @@ class CameraScanner: NSObject, ObservableObject, AVCaptureMetadataOutputObjectsD
         case .avFoundation:
             if session.canAddOutput(metadataOutput) {
                 session.addOutput(metadataOutput)
-                metadataOutput.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+                metadataOutput.setMetadataObjectsDelegate(self, queue: visionQueue)
                 metadataOutput.metadataObjectTypes = [.qr]
             }
         case .vision:

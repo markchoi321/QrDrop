@@ -5,20 +5,43 @@
 //  L3 解码器：解方程（增量高斯消元）与剥洋葱（BP 剥离）。
 //  对应 CONTRACT.md 第 3.2 / 4.4 节。剥离解码维护倒排索引，避免传播步全表扫描。
 //
+//  持久化采用增量日志：解码器把「写一次后永不回改」的成果吐进 journal，
+//  由 ProgressStore 追加到磁盘。两个解码器的成果侧本来就是追加式的——
+//  解方程的基行落进空 pivot 槽后不再修改，剥洋葱的 solved[i] 一旦写入终身不变。
+//
 
 import Foundation
 
-/// 未消解编码块的持久化记录。
-/// 解方程会话中语义不同：blockId 存 pivot 索引，neighbors 存系数向量置 1 的索引。
-struct PendingRecord {
-    let blockId: UInt32
-    let neighbors: [Int]
-    let payload: [UInt8]
+/// 进度记录。增量日志与 checkpoint 共用一套记录，checkpoint 就是日志压实后的形态。
+enum ProgressRecord {
+    /// 已收 blockId，仅用于去重与统计
+    case seen(blockId: UInt32)
+    /// seen 的压实形态：blockId 近乎连续，位图比逐条 seen 小一个数量级
+    case seenMap(base: UInt32, bitCount: Int, bits: [UInt8])
+    /// 剥洋葱：已解出的源块。写入后终身不变
+    case solved(index: Int, data: [UInt8])
+    /// 剥洋葱：度 ≥2 进入 pending 的原始块，载荷未与任何已解块异或。
+    /// 它的度与邻居是 blockId 的确定函数，残值是 (原始块, 已解集合) 的纯函数，
+    /// 因此这条记录随后无论降度多少次都不必回改
+    case rawBlock(blockId: UInt32, payload: [UInt8])
+    /// 剥洋葱：pending 残值。只出现在 checkpoint 里，是若干 rawBlock 压实的结果
+    case pending(blockId: UInt32, neighbors: [Int], payload: [UInt8])
+    /// 解方程：新增的一行消元基。落进空 pivot 槽后不再修改
+    case basis(pivot: Int, coeff: BitSet, data: [UInt8])
 }
 
-struct SolvedRecord {
-    let index: Int
-    let data: [UInt8]
+extension ProgressRecord {
+    /// 把 blockId 集合压成位图记录，空集合返回 nil
+    static func seenMap(of ids: Set<UInt32>) -> ProgressRecord? {
+        guard let lo = ids.min(), let hi = ids.max() else { return nil }
+        let n = Int(hi - lo) + 1
+        var bits = [UInt8](repeating: 0, count: (n + 7) / 8)
+        for id in ids {
+            let off = Int(id - lo)
+            bits[off >> 3] |= UInt8(1) << UInt8(off & 7)
+        }
+        return .seenMap(base: lo, bitCount: n, bits: bits)
+    }
 }
 
 protocol BlockDecoder: AnyObject {
@@ -44,11 +67,19 @@ protocol BlockDecoder: AnyObject {
     /// 释放全部块数据。完成并落盘后调用，避免几十 MB 的中间态一直占着内存
     func releaseStorage()
 
-    func snapshotSolved() -> [SolvedRecord]
-    func snapshotPending() -> [PendingRecord]
-    /// 返回被自检丢弃的 pending 记录数
+    // MARK: 持久化
+
+    /// 取走自上次调用以来新产生的增量记录，取走即清空
+    func takeJournal() -> [ProgressRecord]
+    /// 未取走的增量记录条数，供写盘时机判断
+    var journalCount: Int { get }
+    /// 当前状态压实后的完整记录序列，用于 checkpoint
+    func snapshotRecords() -> [ProgressRecord]
+    /// checkpoint 的估算字节数，用于决定日志何时该压实
+    var snapshotByteEstimate: Int { get }
+    /// 重放记录序列，返回被自检丢弃的记录数
     @discardableResult
-    func restore(solved: [SolvedRecord], pending: [PendingRecord]) -> Int
+    func replay(_ records: [ProgressRecord]) -> Int
 }
 
 extension BlockDecoder {
@@ -76,6 +107,7 @@ final class LinearSolveDecoder: BlockDecoder {
     private var rank = 0
     private var seen = Set<UInt32>()
     private var released = false
+    private var journal: [ProgressRecord] = []
 
     init(K: Int, T: Int) {
         self.K = K
@@ -93,6 +125,7 @@ final class LinearSolveDecoder: BlockDecoder {
 
     func add(blockId: UInt32, payload: ArraySlice<UInt8>) -> Bool {
         guard seen.insert(blockId).inserted else { return false }
+        journal.append(.seen(blockId: blockId))
         var c = composer.coefficients(blockId)
         var d = Array(payload)
         while let p = c.highestBit {
@@ -103,6 +136,8 @@ final class LinearSolveDecoder: BlockDecoder {
                 basisCoeff[p] = c
                 basisData[p] = d
                 rank += 1
+                // 基行一旦落位就再不修改，可直接追加进日志
+                journal.append(.basis(pivot: p, coeff: c, data: d))
                 break
             }
         }
@@ -141,41 +176,51 @@ final class LinearSolveDecoder: BlockDecoder {
         basisCoeff = []
         basisData = []
         seen = []
+        journal = []
         released = true
     }
 
-    /// 解方程会话没有中间态的源块，全部状态都在消元基里
-    func snapshotSolved() -> [SolvedRecord] { [] }
+    // MARK: 持久化
 
-    func snapshotPending() -> [PendingRecord] {
+    func takeJournal() -> [ProgressRecord] {
+        defer { journal.removeAll(keepingCapacity: true) }
+        return journal
+    }
+
+    var journalCount: Int { journal.count }
+
+    /// 解方程会话没有中间态的源块，全部状态都在消元基里
+    func snapshotRecords() -> [ProgressRecord] {
         guard !released else { return [] }
-        var out: [PendingRecord] = []
-        out.reserveCapacity(rank)
+        var out: [ProgressRecord] = []
+        out.reserveCapacity(rank + 1)
         for p in 0..<K {
             guard let c = basisCoeff[p], let d = basisData[p] else { continue }
-            out.append(PendingRecord(blockId: UInt32(p), neighbors: c.indices, payload: d))
+            out.append(.basis(pivot: p, coeff: c, data: d))
         }
+        if let map = ProgressRecord.seenMap(of: seen) { out.append(map) }
         return out
     }
 
+    var snapshotByteEstimate: Int {
+        released ? 0 : rank * (4 + (K + 7) / 8 + T) + seen.count / 8 + 64
+    }
+
     @discardableResult
-    func restore(solved: [SolvedRecord], pending: [PendingRecord]) -> Int {
+    func replay(_ records: [ProgressRecord]) -> Int {
         var dropped = 0
-        for rec in pending {
-            let p = Int(rec.blockId)
-            guard p >= 0, p < K, rec.payload.count == T else { dropped += 1; continue }
-            var c = BitSet(bitCount: K)
-            var ok = true
-            for i in rec.neighbors {
-                if i < 0 || i >= K { ok = false; break }
-                c.set(i)
+        for case let .basis(pivot, coeff, data) in records {
+            guard pivot >= 0, pivot < K, data.count == T, coeff.bitCount == K else {
+                dropped += 1; continue
             }
             // pivot 必须是系数向量的最高位，否则文件已损坏
-            guard ok, c.highestBit == p else { dropped += 1; continue }
-            if basisCoeff[p] == nil { rank += 1 }
-            basisCoeff[p] = c
-            basisData[p] = rec.payload
+            guard coeff.highestBit == pivot else { dropped += 1; continue }
+            if basisCoeff[pivot] == nil { rank += 1 }
+            basisCoeff[pivot] = coeff
+            basisData[pivot] = data
         }
+        replaySeen(records, into: &seen)
+        journal.removeAll(keepingCapacity: true)
         return dropped
     }
 }
@@ -201,6 +246,9 @@ final class PeelingDecoder: BlockDecoder {
     private var inv: [Set<Int>]
     private var seen = Set<UInt32>()
     private var released = false
+    private var journal: [ProgressRecord] = []
+    /// 重放期间不再产生日志，否则恢复一次就把整份状态重新写一遍
+    private var replaying = false
 
     init(K: Int, T: Int, soliton: RobustSoliton? = nil) {
         self.K = K
@@ -221,9 +269,16 @@ final class PeelingDecoder: BlockDecoder {
         return solved[index]
     }
 
+    @inline(__always)
+    private func note(_ record: ProgressRecord) {
+        if !replaying { journal.append(record) }
+    }
+
     func add(blockId: UInt32, payload: ArraySlice<UInt8>) -> Bool {
         guard seen.insert(blockId).inserted else { return false }
-        var pay = Array(payload)
+        // 原始载荷与消元用的副本共享存储，第一次异或才真正分裂（COW）
+        let raw = Array(payload)
+        var pay = raw
         var remaining = Set<Int>()
         for i in composer.neighborsOf(blockId) {
             if let s = solved[i] {
@@ -232,10 +287,16 @@ final class PeelingDecoder: BlockDecoder {
                 remaining.insert(i)
             }
         }
-        if remaining.isEmpty { return true }
+        if remaining.isEmpty {
+            note(.seen(blockId: blockId))
+            return true
+        }
         if remaining.count == 1 {
+            // 直接剥出源块，产出的 solved 记录已包含全部信息，原始块不必留
+            note(.seen(blockId: blockId))
             propagate(remaining.first!, pay)
         } else {
+            note(.rawBlock(blockId: blockId, payload: raw))
             insertPending(PendingEntry(blockId: blockId, neighbors: remaining, payload: pay))
         }
         return true
@@ -266,22 +327,27 @@ final class PeelingDecoder: BlockDecoder {
             if solved[s] != nil { continue }
             solved[s] = item.1
             solvedTotal += 1
+            note(.solved(index: s, data: item.1))
 
             let affected = inv[s]
-            inv[s].removeAll()
+            // 用赋空替代 removeAll：affected 还持着这个集合，removeAll 会为它复制一份内容
+            inv[s] = []
             for idx in affected {
-                guard var ent = pending[idx], ent.neighbors.contains(s) else { continue }
-                ent.neighbors.remove(s)
-                ByteOps.xorInPlace(&ent.payload, item.1)
-                if ent.neighbors.count == 1 {
-                    let next = ent.neighbors.first!
+                guard pending[idx] != nil else { continue }
+                // remove 返回 nil 即表示这条 pending 不含该源块，省掉一次 contains 查找
+                guard pending[idx]!.neighbors.remove(s) != nil else { continue }
+                // 必须原地改。先绑成局部 var 再写回的话，pending[idx] 仍持有同一缓冲区，
+                // 异或会触发 COW，每条边白拷 T 字节——雪崩期有几十万条边
+                ByteOps.xorInPlace(&pending[idx]!.payload, item.1)
+                let degree = pending[idx]!.neighbors.count
+                if degree == 1 {
+                    let next = pending[idx]!.neighbors.first!
                     inv[next].remove(idx)
+                    let payload = pending[idx]!.payload
                     releasePending(idx)
-                    queue.append((next, ent.payload))
-                } else if ent.neighbors.isEmpty {
+                    queue.append((next, payload))
+                } else if degree == 0 {
                     releasePending(idx)
-                } else {
-                    pending[idx] = ent
                 }
             }
         }
@@ -305,51 +371,98 @@ final class PeelingDecoder: BlockDecoder {
         freeSlots = []
         inv = []
         seen = []
+        journal = []
         released = true
     }
 
-    func snapshotSolved() -> [SolvedRecord] {
-        guard !released else { return [] }
-        var out: [SolvedRecord] = []
-        out.reserveCapacity(solvedTotal)
-        for i in 0..<K {
-            if let d = solved[i] { out.append(SolvedRecord(index: i, data: d)) }
-        }
-        return out
+    // MARK: 持久化
+
+    func takeJournal() -> [ProgressRecord] {
+        defer { journal.removeAll(keepingCapacity: true) }
+        return journal
     }
 
-    func snapshotPending() -> [PendingRecord] {
+    var journalCount: Int { journal.count }
+
+    /// 压实：已被剥离的 rawBlock 记录在这里消失，仍活着的收敛成一条 pending 残值
+    func snapshotRecords() -> [ProgressRecord] {
         guard !released else { return [] }
-        var out: [PendingRecord] = []
+        var out: [ProgressRecord] = []
+        out.reserveCapacity(solvedTotal + pendingCount + 1)
+        for i in 0..<K {
+            if let d = solved[i] { out.append(.solved(index: i, data: d)) }
+        }
         for entry in pending {
             guard let e = entry else { continue }
-            out.append(PendingRecord(blockId: e.blockId, neighbors: e.neighbors.sorted(), payload: e.payload))
+            out.append(.pending(blockId: e.blockId, neighbors: e.neighbors.sorted(), payload: e.payload))
         }
+        if let map = ProgressRecord.seenMap(of: seen) { out.append(map) }
         return out
     }
 
+    var snapshotByteEstimate: Int {
+        guard !released else { return 0 }
+        return solvedTotal * (4 + T) + pendingCount * (T + 48) + seen.count / 8 + 64
+    }
+
+    /// 重放顺序有讲究：源块是终态必须先落位，pending 残值与原始块都要在它之上重建，
+    /// 而纯 seen 记录最后补，否则 rawBlock 会被去重挡掉。
     @discardableResult
-    func restore(solved solvedRecords: [SolvedRecord], pending pendingRecords: [PendingRecord]) -> Int {
-        for rec in solvedRecords {
-            guard rec.index >= 0, rec.index < K, rec.data.count == T else { continue }
-            if solved[rec.index] == nil { solvedTotal += 1 }
-            solved[rec.index] = rec.data
+    func replay(_ records: [ProgressRecord]) -> Int {
+        replaying = true
+        defer {
+            replaying = false
+            journal.removeAll(keepingCapacity: true)
         }
         var dropped = 0
-        for rec in pendingRecords {
-            guard rec.payload.count == T else { dropped += 1; continue }
-            // 自检：重算邻居集合并剔除已解出源块，应与存下来的完全一致
-            let recomputed = composer.neighborsOf(rec.blockId).filter { solved[$0] == nil }
-            guard recomputed == rec.neighbors, rec.neighbors.count >= 1 else { dropped += 1; continue }
-            seen.insert(rec.blockId)
-            if rec.neighbors.count == 1 {
-                propagate(rec.neighbors[0], rec.payload)
+
+        for case let .solved(index, data) in records {
+            guard index >= 0, index < K, data.count == T else { dropped += 1; continue }
+            if solved[index] == nil { solvedTotal += 1 }
+            solved[index] = data
+        }
+
+        // checkpoint 的 pending 残值：邻居可由 blockId 重算，存下来只作 PRNG 一致性自检
+        for case let .pending(blockId, neighbors, payload) in records {
+            guard payload.count == T, !neighbors.isEmpty else { dropped += 1; continue }
+            let recomputed = composer.neighborsOf(blockId).filter { solved[$0] == nil }
+            guard recomputed == neighbors else { dropped += 1; continue }
+            guard seen.insert(blockId).inserted else { continue }
+            if neighbors.count == 1 {
+                propagate(neighbors[0], payload)
             } else {
-                insertPending(PendingEntry(blockId: rec.blockId,
-                                           neighbors: Set(rec.neighbors),
-                                           payload: rec.payload))
+                insertPending(PendingEntry(blockId: blockId, neighbors: Set(neighbors), payload: payload))
             }
         }
+
+        // 日志里的原始块：走正常 add，对已落位的源块重新消元，重现存盘那一刻的残值。
+        // 异或次数与当初增量降度时完全相同，没有多做一次
+        for case let .rawBlock(blockId, payload) in records {
+            guard payload.count == T else { dropped += 1; continue }
+            _ = add(blockId: blockId, payload: payload[...])
+        }
+
+        replaySeen(records, into: &seen)
         return dropped
+    }
+}
+
+// MARK: - 共用
+
+/// 把 seen / seenMap 记录并回 blockId 集合
+private func replaySeen(_ records: [ProgressRecord], into seen: inout Set<UInt32>) {
+    for record in records {
+        switch record {
+        case .seen(let blockId):
+            seen.insert(blockId)
+        case .seenMap(let base, let bitCount, let bits):
+            for off in 0..<bitCount where off >> 3 < bits.count {
+                if bits[off >> 3] & (UInt8(1) << UInt8(off & 7)) != 0 {
+                    seen.insert(base &+ UInt32(off))
+                }
+            }
+        default:
+            break
+        }
     }
 }

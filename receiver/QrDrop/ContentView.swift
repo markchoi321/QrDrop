@@ -47,6 +47,11 @@ struct ContentView: View {
             .sheet(isPresented: $showLoadPicker) {
                 DocumentPickerView(receiver: receiver)
             }
+            .task {
+                // 界面不再持有会话对象，改为按固定节拍取不可变快照，
+                // 视图消失时 SwiftUI 会自动取消这个 task
+                await receiver.runRefreshLoop()
+            }
             .onChange(of: scenePhase) { _, phase in
                 // 进入后台立即全量保存，设计 9.3
                 if phase != .active { receiver.saveAllProgress(force: true) }
@@ -224,7 +229,6 @@ struct ContentView: View {
             ForEach(receiver.sortedSessions) { session in
                 SessionProgressSection(
                     session: session,
-                    revision: receiver.revision,
                     isExpanded: expandedSessionId == session.sessionId,
                     onTap: {
                         withAnimation {
@@ -239,9 +243,7 @@ struct ContentView: View {
             }
 
             ForEach(receiver.sortedLegacyFiles) { file in
-                LegacyFileSection(file: file,
-                                  revision: receiver.revision,
-                                  onExport: { exportLegacy(file) })
+                LegacyFileSection(file: file, onExport: { exportLegacy(file) })
             }
         }
         .listStyle(.insetGrouped)
@@ -289,19 +291,21 @@ struct ContentView: View {
     // MARK: - 操作方法
 
     private func exportProgress() {
-        do {
-            let data = try receiver.encodeProgress()
-            let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("qrdrop_\(Int(Date().timeIntervalSince1970)).vdpg")
-            try data.write(to: tempURL)
-            receiver.addLog("进度已准备导出（\(data.count) 字节）")
-            share(tempURL)
-        } catch {
-            receiver.addLog("导出进度失败: \(error.localizedDescription)", isError: true)
+        Task {
+            do {
+                let data = await receiver.encodeProgress()
+                let tempURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("qrdrop_\(Int(Date().timeIntervalSince1970)).vdpg")
+                try data.write(to: tempURL)
+                receiver.addLog("进度已准备导出（\(data.count) 字节）")
+                share(tempURL)
+            } catch {
+                receiver.addLog("导出进度失败: \(error.localizedDescription)", isError: true)
+            }
         }
     }
 
-    private func exportSession(_ session: ReceiveSession, viaShareSheet: Bool) {
+    private func exportSession(_ session: SessionSnapshot, viaShareSheet: Bool) {
         guard let url = session.savedFileURL else {
             receiver.addLog("会话尚未合并，无法导出文件", isError: true)
             return
@@ -332,18 +336,18 @@ struct ContentView: View {
         if !ok { receiver.addLog("找不到可呈现分享面板的窗口", isError: true) }
     }
 
-    private func exportLegacy(_ file: LegacyFile) {
-        var fileData = Data()
-        for i in 0..<file.totalChunks {
-            if let chunk = file.chunks[i] { fileData.append(chunk) }
-        }
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(file.fileName)
-        do {
-            try fileData.write(to: tempURL)
-            receiver.addLog("旧格式文件已导出: \(file.fileName)（\(fileData.count) 字节）")
-            share(tempURL)
-        } catch {
-            receiver.addLog("导出失败: \(error.localizedDescription)", isError: true)
+    private func exportLegacy(_ file: LegacyFileSnapshot) {
+        Task {
+            guard let assembled = await receiver.assembleLegacy(file) else { return }
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(assembled.fileName)
+            do {
+                try assembled.data.write(to: tempURL)
+                receiver.addLog("旧格式文件已导出: \(assembled.fileName)（\(assembled.data.count) 字节）")
+                share(tempURL)
+            } catch {
+                receiver.addLog("导出失败: \(error.localizedDescription)", isError: true)
+            }
         }
     }
 }
@@ -351,9 +355,7 @@ struct ContentView: View {
 // MARK: - 会话进度 Section
 
 struct SessionProgressSection: View {
-    let session: ReceiveSession
-    /// 仅用于触发重绘，ReceiveSession 是引用类型，SwiftUI 无法感知其内部变化
-    let revision: Int
+    let session: SessionSnapshot
     let isExpanded: Bool
     let onTap: () -> Void
     let onExport: () -> Void
@@ -385,7 +387,7 @@ struct SessionProgressSection: View {
                         .foregroundStyle(.secondary)
 
                     // 次要指标：源块解出比例
-                    Text("源块 \(session.decoder.solvedCount)/\(session.K)（\(Int(session.sourceProgress * 100))%）")
+                    Text("源块 \(session.solvedCount)/\(session.K)（\(Int(session.sourceProgress * 100))%）")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
@@ -467,8 +469,8 @@ struct SessionProgressSection: View {
             infoRow("参数", "K=\(session.K) · T=\(session.T) · \(session.codec.displayName) · m=\(session.blocksPerFrame)")
             infoRow("冗余系数 ε", String(format: "%.2f%%", session.epsilon * 100))
             infoRow("压缩", session.compressed ? "是" : "否")
-            if let meta = session.meta {
-                infoRow("原始大小", "\(meta.originalSize) 字节")
+            if let originalSize = session.originalSize {
+                infoRow("原始大小", "\(originalSize) 字节")
             }
             infoRow("帧 通过/拒绝", "\(session.stats.framesAccepted) / \(session.stats.framesRejected)")
             infoRow("块 收到/重复", "\(session.stats.blocksReceived) / \(session.stats.blocksDuplicate)")
@@ -500,8 +502,7 @@ struct SessionProgressSection: View {
 // MARK: - 旧格式文件 Section
 
 struct LegacyFileSection: View {
-    let file: LegacyFile
-    let revision: Int
+    let file: LegacyFileSnapshot
     let onExport: () -> Void
 
     var body: some View {
@@ -514,8 +515,8 @@ struct LegacyFileSection: View {
                         .font(.headline)
                         .lineLimit(1)
                 }
-                ProgressView(value: Double(file.chunks.count), total: Double(max(1, file.totalChunks)))
-                Text("\(file.chunks.count)/\(file.totalChunks) 片段")
+                ProgressView(value: Double(file.receivedChunks), total: Double(max(1, file.totalChunks)))
+                Text("\(file.receivedChunks)/\(file.totalChunks) 片段")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
 
