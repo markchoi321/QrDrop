@@ -29,6 +29,8 @@ struct SessionSnapshot: Identifiable, Sendable, Equatable {
     let blocksPerFrame: Int
     let epsilon: Double
     let displayName: String
+    /// 元数据里的文件名，未解析出头部时为 nil。界面用它区分「已知文件名」与「仍在识别」
+    let fileName: String?
     /// 元数据里的原始大小，未解析出头部时为 nil
     let originalSize: UInt64?
     let stats: SessionStats
@@ -67,6 +69,8 @@ struct EngineLogLine: Sendable {
 struct EngineSnapshot: Sendable {
     var sessions: [SessionSnapshot] = []
     var legacyFiles: [LegacyFileSnapshot] = []
+    /// 已合并落盘的文件，来自持久化清单，跨启动保留
+    var receivedFiles: [ReceivedFileRecord] = []
     /// 自上次取快照以来新产生的日志
     var newLogs: [EngineLogLine] = []
 }
@@ -81,6 +85,14 @@ actor DecodeEngine {
     private var legacyFiles: [String: LegacyFile] = [:]
     /// 每会话的增量日志写入器，FileHandle 常开
     private var journals: [UInt32: ProgressJournal] = [:]
+    /// 已完成文件清单。合并成功的会话从 sessions 移出、写进这里并落盘，
+    /// 因此「刚完成」与「上次启动完成的」在界面上是同一条路径
+    private var receivedFiles: [ReceivedFileRecord] = []
+    /// 已完成会话的 id。会话在完成后被移出 sessions，若不另记一份，
+    /// 发送端还在播的同一个文件会被当成新会话从头收一遍，列表里出现两条同名进度
+    private var completedSessionIds: Set<UInt32> = []
+    /// 已经提示过「该文件已接收完成」的会话，避免每帧刷一行日志
+    private var ignoredCompletedLogged: Set<UInt32> = []
     /// 待随快照带给界面的日志
     private var pendingLogs: [EngineLogLine] = []
 
@@ -115,6 +127,7 @@ actor DecodeEngine {
             .sorted { $0.fileId < $1.fileId }
             .map { LegacyFileSnapshot(fileId: $0.fileId, fileName: $0.fileName,
                                       totalChunks: $0.totalChunks, receivedChunks: $0.chunks.count) }
+        out.receivedFiles = receivedFiles.sorted { $0.receivedAt > $1.receivedAt }
         out.newLogs = pendingLogs
         pendingLogs.removeAll(keepingCapacity: true)
         return out
@@ -129,6 +142,7 @@ actor DecodeEngine {
                         blocksPerFrame: s.blocksPerFrame,
                         epsilon: s.epsilon,
                         displayName: s.displayName,
+                        fileName: s.meta?.fileName,
                         originalSize: s.meta?.originalSize,
                         stats: s.stats,
                         solvedCount: s.decoder.solvedCount,
@@ -144,7 +158,7 @@ actor DecodeEngine {
                         finalSize: s.finalSize)
     }
 
-    var isEmpty: Bool { sessions.isEmpty && legacyFiles.isEmpty }
+    var isEmpty: Bool { sessions.isEmpty && legacyFiles.isEmpty && receivedFiles.isEmpty }
     var sessionCount: Int { sessions.count }
 
     func sessionSnapshot(_ sessionId: UInt32) -> SessionSnapshot? {
@@ -189,6 +203,16 @@ actor DecodeEngine {
             if bytes.count >= 6 {
                 let sid = ByteOps.readUInt32(bytes, 2)
                 sessions[sid]?.stats.framesRejected += 1
+            }
+            return false
+        }
+
+        // 同一个文件已经收完并落盘了，发送端却还在循环播放。
+        // 不挡住的话这里会新建一个同 sessionId 的会话从零开始收，
+        // 界面上就变成「已完成的文件」和「刚开始的进度」两条同名记录
+        if completedSessionIds.contains(frame.sessionId) {
+            if ignoredCompletedLogged.insert(frame.sessionId).inserted {
+                log("\(SessionId.hex(frame.sessionId)) 已接收完成，忽略后续帧")
             }
             return false
         }
@@ -304,6 +328,17 @@ actor DecodeEngine {
             session.decoder.releaseStorage()
             closeJournal(sessionId)
             ProgressStore.remove(sessionId: sessionId)
+            // 完成的会话从 sessions 移出，改由持久化清单承载。
+            // 先前它只活在内存里，退出 App 后文件仍在 received/ 下却再无入口可达
+            sessions.removeValue(forKey: sessionId)
+            receivedFiles.removeAll { $0.sessionId == sessionId }
+            receivedFiles.append(ReceivedFileRecord(sessionId: sessionId,
+                                                    fileName: url.lastPathComponent,
+                                                    size: size,
+                                                    receivedAt: Date()))
+            completedSessionIds.insert(sessionId)
+            ignoredCompletedLogged.remove(sessionId)
+            ReceivedFileStore.save(receivedFiles)
             log("接收完成：\(meta.fileName)（\(size) 字节，SHA-256 通过）")
             log(String(format: "  耗时 合计%dms = 拼接%.0f + 解流%.0f + 校验%.0f + 写盘%.0f",
                        totalMs, t.assemble * 1000, t.parse * 1000, t.hash * 1000, t.write * 1000))
@@ -459,6 +494,14 @@ actor DecodeEngine {
     /// App 启动时扫描目录恢复：checkpoint 装底，增量日志重放在上
     func restoreProgress() {
         let started = Date()
+        // 已完成文件与未完成进度是两份独立的持久化，缺一都会让用户觉得「东西没了」
+        receivedFiles = ReceivedFileStore.load()
+        completedSessionIds = Set(receivedFiles.map(\.sessionId))
+        if !receivedFiles.isEmpty {
+            // 清单里可能有已被用户在「文件」App 删掉的条目，load 已过滤，这里回写一次
+            ReceivedFileStore.save(receivedFiles)
+            log("已恢复 \(receivedFiles.count) 个已完成文件")
+        }
         let loaded = ProgressStore.loadAll()
         for session in loaded.sessions where sessions[session.sessionId] == nil {
             sessions[session.sessionId] = session
@@ -506,10 +549,46 @@ actor DecodeEngine {
         checkpointBytesWritten = 0
         sessions.removeAll()
         legacyFiles.removeAll()
+        receivedFiles.removeAll()
+        completedSessionIds.removeAll()
+        ignoredCompletedLogged.removeAll()
+        ReceivedFileStore.removeManifest()
         throughput.reset()
         let progressCount = ProgressStore.clearAll()
         let fileCount = DecodeEngine.clearReceivedFiles()
         log("数据已清空：\(progressCount) 个进度文件，\(fileCount) 个已接收文件")
+    }
+
+    // MARK: - 单条删除（列表滑动删除）
+
+    /// 删除一个未完成的会话：内存状态、日志句柄、磁盘进度文件一起清。
+    /// 少清任何一处，下一次刷盘或下一次启动它都会回来
+    func deleteSession(_ sessionId: UInt32) {
+        guard let session = sessions[sessionId] else { return }
+        let name = session.displayName
+        session.finalizeCancel?.set()
+        closeJournal(sessionId)
+        sessions.removeValue(forKey: sessionId)
+        ProgressStore.remove(sessionId: sessionId)
+        log("已删除会话 \(name)")
+    }
+
+    /// 删除一个已完成文件：清单记录与 received/ 下的文件一起删
+    func deleteReceivedFile(_ sessionId: UInt32) {
+        guard let index = receivedFiles.firstIndex(where: { $0.sessionId == sessionId }) else { return }
+        let record = receivedFiles.remove(at: index)
+        try? FileManager.default.removeItem(at: record.url)
+        // 删掉之后允许重新接收同一个文件，否则发送端还在播也收不进来
+        completedSessionIds.remove(sessionId)
+        ignoredCompletedLogged.remove(sessionId)
+        ReceivedFileStore.save(receivedFiles)
+        log("已删除文件 \(record.fileName)")
+    }
+
+    /// 删除一个旧格式文件。它没有磁盘持久化，清内存即可
+    func deleteLegacyFile(_ fileId: String) {
+        guard let file = legacyFiles.removeValue(forKey: fileId) else { return }
+        log("已删除旧格式文件 \(file.fileName)")
     }
 
     /// 删除 received/ 目录下已落盘的最终文件，返回删除个数

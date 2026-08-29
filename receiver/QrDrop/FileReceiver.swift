@@ -40,6 +40,62 @@ enum ScanResolution: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 }
 
+// MARK: - 扫描模式预设
+
+/// 把「引擎 + 分辨率 + 帧率」三个工程旋钮打包成用户能凭直觉选的三档。
+/// 想细调的人仍可切到「自定义」，但默认路径上一个参数都不用碰。
+enum ScanPreset: String, CaseIterable, Identifiable, Sendable {
+    case battery  = "省电"
+    case balanced = "标准"
+    case fast     = "高速"
+    case custom   = "自定义"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .battery:  return "leaf.fill"
+        case .balanced: return "checkmark.seal.fill"
+        case .fast:     return "bolt.fill"
+        case .custom:   return "slider.horizontal.3"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .battery:  return "耗电与发热最低，适合长时间接收大文件"
+        case .balanced: return "多数情况下的最佳选择，识别率与功耗兼顾"
+        case .fast:     return "降画质换解码速度，净速率最高，机身会明显发热"
+        case .custom:   return "自行指定识别引擎、画质与扫描频率"
+        }
+    }
+
+    /// 各档对应的三个参数；custom 不改动当前值。
+    ///
+    /// 高速档用 Vision 而不是 AVFoundation：后者的检测器实测封顶约 30 次/秒，
+    /// 且与常见的 30fps 发送端正好构成 1:1 整数比而相位锁定，一半的解码结果是重复的，
+    /// 净速率反而低于标准档。
+    ///
+    /// 而 Vision 的解码帧率恒等于 1 / 单帧推理耗时（推理必须在采集回调里同步跑，
+    /// 见 CameraScanner.visionQueue），所以唯一能抬高它的办法是让单帧更便宜——
+    /// 也就是降分辨率。720p 的像素量只有 1080p 的 44%，代价是每个码元的像素数变少，
+    /// 发送端屏幕有眩光或划痕时解码裕量更小。
+    var parameters: (engine: QREngine, resolution: ScanResolution, fps: Int)? {
+        switch self {
+        case .battery:  return (.avFoundation, .hd720p, 20)
+        case .balanced: return (.vision, .hd1080p, 30)
+        case .fast:     return (.vision, .hd720p, 60)
+        case .custom:   return nil
+        }
+    }
+
+    /// 摘要，直接给用户看的一行参数
+    var summary: String? {
+        guard let p = parameters else { return nil }
+        return "\(p.engine.rawValue) · \(p.resolution.rawValue) · \(p.fps)fps"
+    }
+}
+
 // MARK: - 旧 JSON 格式（兼容分支，只保留解析与重组）
 
 struct QRChunk: Codable, Sendable {
@@ -84,15 +140,37 @@ final class FileReceiver: ObservableObject {
     @Published private(set) var sessions: [SessionSnapshot] = []
     /// 旧 JSON 格式文件的快照
     @Published private(set) var legacyFiles: [LegacyFileSnapshot] = []
+    /// 已完成并落盘的文件，跨启动保留
+    @Published private(set) var receivedFiles: [ReceivedFileRecord] = []
     @Published var logs: [LogEntry] = []
-    @Published var selectedEngine: QREngine = .vision
-    /** 扫描最大帧率，5/10/15/20/25/30 六档，默认 30fps */
-    @Published var maxScanFps: Int = 30
+    @Published var selectedEngine: QREngine = .vision {
+        didSet { persistSettings() }
+    }
+    /** 扫描最大帧率，5…60fps，默认 30fps */
+    @Published var maxScanFps: Int = 30 {
+        didSet { persistSettings() }
+    }
     /** 摄像头分辨率，默认 1080p */
-    @Published var scanResolution: ScanResolution = .hd1080p
+    @Published var scanResolution: ScanResolution = .hd1080p {
+        didSet { persistSettings() }
+    }
+    /** 扫描模式预设。选中非自定义档时同步覆盖上面三个参数 */
+    @Published var scanPreset: ScanPreset = .balanced {
+        didSet { applyPreset() }
+    }
+
+    /// 刚刚完成的文件名，供界面弹出完成提示后清空
+    @Published var justCompleted: String?
 
     /// 解码与持久化的唯一所有者
     let engine = DecodeEngine()
+
+    /// 已请求过自动合并的会话。快照每 100ms 一次，没有这层去重会重复投递合并请求
+    private var autoFinalizeRequested: Set<UInt32> = []
+    /// 上一轮已完成的会话，用于识别「本次刚刚完成」的那一个
+    private var knownFinishedIds: Set<UInt32> = []
+    /// 启动后是否已经读过一次已完成清单。首轮全是历史记录，不该弹完成提示
+    private var didLoadInitialReceivedFiles = false
 
     /// 接收速率统计，按去重后的编码块字节数计。自带锁，可直接读
     nonisolated var throughput: ThroughputMeter { engine.throughput }
@@ -102,10 +180,64 @@ final class FileReceiver: ObservableObject {
     private let refreshInterval: Duration = .milliseconds(100)
 
     init() {
+        restoreSettings()
         Task { [engine] in
             await engine.restoreProgress()
             await self.refresh()
         }
+    }
+
+    // MARK: - 扫描参数持久化
+
+    private enum Keys {
+        static let engine = "scan.engine"
+        static let fps = "scan.fps"
+        static let resolution = "scan.resolution"
+        static let preset = "scan.preset"
+    }
+
+    /// 预设变更时下发三个参数。didSet 会连带触发 persistSettings，
+    /// 但 isApplyingPreset 挡住了「参数变更又把预设改回自定义」的回环
+    private var isApplyingPreset = false
+
+    private func applyPreset() {
+        guard let p = scanPreset.parameters else {
+            persistSettings()
+            return
+        }
+        isApplyingPreset = true
+        selectedEngine = p.engine
+        scanResolution = p.resolution
+        maxScanFps = p.fps
+        isApplyingPreset = false
+        persistSettings()
+    }
+
+    /// 用户直接改了某个参数，说明他要的是自定义档
+    private func persistSettings() {
+        if !isApplyingPreset, scanPreset != .custom, let p = scanPreset.parameters,
+           p.engine != selectedEngine || p.resolution != scanResolution || p.fps != maxScanFps {
+            scanPreset = .custom
+            return
+        }
+        let d = UserDefaults.standard
+        d.set(selectedEngine.rawValue, forKey: Keys.engine)
+        d.set(maxScanFps, forKey: Keys.fps)
+        d.set(scanResolution.rawValue, forKey: Keys.resolution)
+        d.set(scanPreset.rawValue, forKey: Keys.preset)
+    }
+
+    private func restoreSettings() {
+        let d = UserDefaults.standard
+        guard let presetRaw = d.string(forKey: Keys.preset),
+              let preset = ScanPreset(rawValue: presetRaw) else { return }
+        isApplyingPreset = true
+        if let e = d.string(forKey: Keys.engine).flatMap(QREngine.init(rawValue:)) { selectedEngine = e }
+        if let r = d.string(forKey: Keys.resolution).flatMap(ScanResolution.init(rawValue:)) { scanResolution = r }
+        let fps = d.integer(forKey: Keys.fps)
+        if fps > 0 { maxScanFps = fps }
+        scanPreset = preset
+        isApplyingPreset = false
     }
 
     // MARK: - 快照拉取
@@ -123,7 +255,40 @@ final class FileReceiver: ObservableObject {
         let snap = await engine.snapshot()
         if sessions != snap.sessions { sessions = snap.sessions }
         if legacyFiles != snap.legacyFiles { legacyFiles = snap.legacyFiles }
+        if receivedFiles != snap.receivedFiles {
+            detectNewCompletion(snap.receivedFiles)
+            receivedFiles = snap.receivedFiles
+        }
         for line in snap.newLogs { addLog(line.message, isError: line.isError) }
+        driveAutoFinalize()
+        // 首轮结束才开启完成提示：启动时从清单恢复出的历史文件不是「刚刚完成」
+        didLoadInitialReceivedFiles = true
+    }
+
+    /// 本轮新出现的已完成文件，用于弹一次完成提示
+    private func detectNewCompletion(_ latest: [ReceivedFileRecord]) {
+        let ids = Set(latest.map(\.sessionId))
+        defer { knownFinishedIds = ids }
+        guard didLoadInitialReceivedFiles else { return }
+        if let newId = ids.subtracting(knownFinishedIds).first,
+           let record = latest.first(where: { $0.sessionId == newId }) {
+            justCompleted = record.fileName
+        }
+    }
+
+    /// 收齐即自动合并。
+    ///
+    /// 合并本身仍在 detached task 上跑（见 DecodeEngine.startFinalize），不会堵住取景，
+    /// 所以没有理由再要求用户回主界面手点一次——那是整个流程里最容易卡住人的一步。
+    /// 合并失败的会话不会被再次自动触发，改由界面给出「重试」。
+    private func driveAutoFinalize() {
+        for session in sessions where session.needsAutoFinalize {
+            guard autoFinalizeRequested.insert(session.sessionId).inserted else { continue }
+            startFinalize(session)
+        }
+        // 完成后可以忘掉，会话被清空重来时也不至于漏掉第二次合并
+        let liveIds = Set(sessions.map(\.sessionId))
+        autoFinalizeRequested.formIntersection(liveIds)
     }
 
     var sortedSessions: [SessionSnapshot] { sessions }
@@ -171,6 +336,35 @@ final class FileReceiver: ObservableObject {
     func clearAll() {
         Task { [engine] in
             await engine.clearAll()
+            await self.refresh()
+        }
+    }
+
+    // MARK: - 单条删除
+
+    func deleteSession(_ session: SessionSnapshot) {
+        // 本地先移除，避免下一次快照到来前列表还留着已删的行
+        sessions.removeAll { $0.sessionId == session.sessionId }
+        autoFinalizeRequested.remove(session.sessionId)
+        Task { [engine] in
+            await engine.deleteSession(session.sessionId)
+            await self.refresh()
+        }
+    }
+
+    func deleteReceivedFile(_ record: ReceivedFileRecord) {
+        receivedFiles.removeAll { $0.sessionId == record.sessionId }
+        knownFinishedIds.remove(record.sessionId)
+        Task { [engine] in
+            await engine.deleteReceivedFile(record.sessionId)
+            await self.refresh()
+        }
+    }
+
+    func deleteLegacyFile(_ file: LegacyFileSnapshot) {
+        legacyFiles.removeAll { $0.fileId == file.fileId }
+        Task { [engine] in
+            await engine.deleteLegacyFile(file.fileId)
             await self.refresh()
         }
     }
