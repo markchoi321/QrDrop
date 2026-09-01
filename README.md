@@ -87,18 +87,28 @@ Web 发送端是**一个双击就能打开的 HTML 文件**，零依赖、零构
 
 **Web 版**（推荐，任何设备都能用）：双击 `sender/web/index.html`，浏览器里选择要传的文件即可。
 
-**桌面版**（Java，支持流层压缩）：
+**桌面版**（Java，支持流层压缩，只依赖 ZXing core 2.3.0）：
 
 ```bash
 mvn -o -f sender/java/pom.xml clean package
-java -cp sender/java/target/classes:<zxing jar> org.file.qrcode.QRCodeGeneratorGUI
+java -cp sender/java/target/classes:<zxing core jar> org.file.qrcode.SenderApp
 ```
 
-不带参数启动会弹出文件选择框，支持多选，每个文件是一个独立会话。
+启动后点「选择文件」，一个文件就是一个会话。
+
+**单文件精简版**（`sender/java-min/QrDropSender.java`，整套协议 + 界面就一个文件，只依赖 ZXing core）：
+
+```bash
+javac -encoding UTF-8 -cp core-2.3.0.jar sender/java-min/QrDropSender.java
+java -cp core-2.3.0.jar:sender/java-min QrDropSender                      # 图形界面
+java -cp core-2.3.0.jar:sender/java-min QrDropSender --dump 待传文件 out.vddump 2   # 无界面导出帧转储
+```
+
+帧字节与完整版逐位相同（已对拍），区别只是不做播放状态持久化。
 
 ### 二、对焦
 
-选好文件后先进入对焦阶段——屏幕上显示一帧静止的二维码，用来让接收端从容取景、对准、合焦。建议此时把发送端切到全屏（纯白背景、无边框），识别率明显更好。
+选好文件后屏幕上先静止显示一帧二维码，用来让接收端从容取景、对准、合焦。建议此时点「全屏」（纯白背景、无边框），识别率明显更好，ESC 退出全屏。
 
 ### 三、开始播放，用手机扫
 

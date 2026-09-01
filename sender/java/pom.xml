@@ -15,16 +15,11 @@
     </properties>
 
     <dependencies>
-        <!-- ZXing 二维码生成库 -->
+        <!-- ZXing 二维码生成库：只用 core，渲染自己做（javase 的 MatrixToImageWriter 用不上） -->
         <dependency>
             <groupId>com.google.zxing</groupId>
             <artifactId>core</artifactId>
-            <version>3.5.1</version>
-        </dependency>
-        <dependency>
-            <groupId>com.google.zxing</groupId>
-            <artifactId>javase</artifactId>
-            <version>3.5.1</version>
+            <version>2.3.0</version>
         </dependency>
 
         <!-- 协议测试向量比对（Jackson / commons-codec 随 JSON 分片方案一并移除） -->
